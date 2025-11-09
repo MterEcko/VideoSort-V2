@@ -7,7 +7,7 @@ import subprocess
 import json
 import logging
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, List
 import shutil
 
 class VideoConverter:
@@ -92,7 +92,13 @@ class VideoConverter:
                 return video_info
             else:
                 self.log_progress(f"Error obteniendo info de video: {result.stderr}", "ERROR")
-        def needs_conversion(self, video_info: Dict) -> Tuple[bool, List[str]]:
+                return None
+                
+        except Exception as e:
+            self.log_progress(f"Error analizando video: {e}", "ERROR")
+            return None
+    
+    def needs_conversion(self, video_info: Dict) -> Tuple[bool, List[str]]:
         """Determinar si el video necesita conversión"""
         conversion_reasons = []
         
@@ -410,7 +416,3 @@ class VideoConverter:
         except Exception as e:
             self.log_progress(f"Error en conversión en lote: {e}", "ERROR")
             return stats
-                
-        except Exception as e:
-            self.log_progress(f"Error analizando video: {e}", "ERROR")
-            return None

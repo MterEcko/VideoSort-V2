@@ -29,25 +29,35 @@ class AudioAnalyzer:
         self.whisper_model = None
         self.opensubtitles_base_url = "https://api.opensubtitles.com/api/v1"
         
-        # Cargar modelo Whisper si está disponible
-        if WHISPER_AVAILABLE:
-            self.load_whisper_model()
+        # NO cargar modelo Whisper automáticamente en __init__
+        # Se cargará cuando se necesite para evitar problemas de inicialización
     
     def log_progress(self, message: str, level: str = "INFO"):
         """Enviar mensaje de progreso"""
         if self.progress_callback:
-            self.progress_callback(message, level)
-        logging.info(message)
+            try:
+                self.progress_callback(message, level)
+            except (AttributeError, TypeError):
+                # Si el callback no está listo, usar logging
+                logging.info(message)
+        else:
+            logging.info(message)
     
     def load_whisper_model(self):
         """Cargar modelo Whisper"""
+        if not WHISPER_AVAILABLE:
+            self.log_progress("Whisper no está disponible", "WARNING")
+            return False
+            
         try:
             model_name = self.config.get("whisper_model", "base")
             self.log_progress(f"Cargando modelo Whisper: {model_name}")
             self.whisper_model = whisper.load_model(model_name)
             self.log_progress("Modelo Whisper cargado exitosamente")
+            return True
         except Exception as e:
             self.log_progress(f"Error cargando modelo Whisper: {e}", "ERROR")
+            return False
     
     def extract_audio_segment(self, video_path: Path, start_time: int, duration: int, output_path: Path) -> bool:
         """Extraer segmento de audio usando ffmpeg"""
@@ -81,9 +91,11 @@ class AudioAnalyzer:
     def transcribe_audio(self, audio_path: Path, language: str = "es") -> Optional[Dict]:
         """Transcribir audio usando Whisper"""
         try:
+            # Cargar modelo si no está cargado
             if not self.whisper_model:
-                self.log_progress("Modelo Whisper no disponible", "ERROR")
-                return None
+                if not self.load_whisper_model():
+                    self.log_progress("Modelo Whisper no disponible", "ERROR")
+                    return None
             
             self.log_progress(f"Transcribiendo audio: {audio_path.name}")
             

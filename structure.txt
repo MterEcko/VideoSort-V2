@@ -1,0 +1,2258 @@
+{
+  "Software_Nombre": "Video Sort",
+  "Version": "2.0.0",
+  "Objetivo": "Identificar automáticamente series y películas (archivos > 50 min) en un entorno local, normalizar metadata y estructura para Jellyfin, minimizando costos operativos y falsos positivos.",
+  
+  "Configuracion_General": {
+    "rutas": {
+      "carpeta_escaneo": "/media/archivos_sin_procesar",
+      "carpeta_destino_jellyfin": "/media/jellyfin",
+      "carpeta_cuarentena": "/media/cuarentena",
+      "carpeta_logs": "/var/log/contentid"
+    },
+    "filtros_iniciales": {
+      "duracion_minima_segundos": 3000,
+      "extensiones_permitidas": [".mkv", ".mp4", ".avi", ".m4v", ".ts"],
+      "tamano_minimo_mb": 100,
+      "ignorar_samples": true,
+      "patron_exclusion_regex": ".*(/sample/|/extras/|/featurettes/).*"
+    },
+    "concurrencia": {
+      "max_workers_paralelos": 4,
+      "procesamiento_por_lotes": 50,
+      "rate_limit_apis": {
+        "tmdb_requests_per_second": 3.5,
+        "acoustid_requests_per_second": 2.2,
+        "gemini_requests_per_minute": 10
+      }
+    }
+  },
+
+  "Modulos_Opcionales": {
+    "analisis_tecnico_habilitado": true,
+    "normalizacion_pistas_audio_habilitado": true,
+    "normalizacion_pistas_subtitulos_habilitado": true,
+    "insertar_metadata_en_archivo_habilitado": true,
+    "renombrado_jellyfin_habilitado": true,
+    "mover_archivo_destino_habilitado": false,
+    "eliminar_archivo_original_habilitado": false,
+    "generar_nfo_jellyfin_habilitado": true,
+    "descargar_poster_fanart_habilitado": false
+  },
+
+  "Orden_Ejecucion_Capas": {
+    "descripcion": "Define el orden en que se ejecutan las capas. Puedes modificar este array para cambiar la secuencia.",
+    "secuencia_capas": [
+      "Capa_1_Hashing_Perceptual",
+      "Capa_0_Metadatos_Textuales",
+      "Capa_2_Audio_Fingerprint",
+      "Capa_3_Verificacion_IA"
+    ],
+    "nota": "Empezar con Capa 1 (pHash) puede descartar ~70-80% de archivos basura antes de consultar TMDb API"
+  },
+
+  "Estructura_Base_Datos_Referencia": {
+    "Nombre": "DB_Huellas_Referencia",
+    "Motor": "PostgreSQL 14+ o MySQL 8.0+",
+    "Caracteristicas_Requeridas": ["JSON support", "Full-text search", "Indices B-tree"],
+    
+    "Tablas": [
+      {
+        "Nombre": "PELICULAS_SERIES",
+        "Descripcion": "Catálogo maestro de contenido",
+        "Campos": [
+          {"Nombre": "tmdb_id", "Tipo": "INT", "Clave": "Primaria", "Descripcion": "ID único de TMDb"},
+          {"Nombre": "tipo_contenido", "Tipo": "ENUM('MOVIE','TV')", "Descripcion": "Tipo de contenido"},
+          {"Nombre": "titulo_es", "Tipo": "VARCHAR(255)", "Indice": "FULLTEXT", "Descripcion": "Título oficial español"},
+          {"Nombre": "titulo_en", "Tipo": "VARCHAR(255)", "Indice": "FULLTEXT", "Descripcion": "Título oficial inglés"},
+          {"Nombre": "titulo_original", "Tipo": "VARCHAR(255)", "Indice": "FULLTEXT", "Descripcion": "Título en idioma original"},
+          {"Nombre": "año_estreno", "Tipo": "YEAR", "Descripcion": "Año de lanzamiento"},
+          {"Nombre": "alias_conocidos", "Tipo": "JSON", "Descripcion": "Array de nombres alternativos ['Breaking Bad', 'BrBa', 'Br Bad']"},
+          {"Nombre": "duracion_promedio_minutos", "Tipo": "INT", "Descripcion": "Duración típica (películas) o episodios (series)"},
+          {"Nombre": "generos", "Tipo": "JSON", "Descripcion": "Array de géneros"},
+          {"Nombre": "popularidad_tmdb", "Tipo": "FLOAT", "Descripcion": "Score de popularidad para desambiguar"},
+          {"Nombre": "fecha_agregado", "Tipo": "DATETIME", "Default": "CURRENT_TIMESTAMP"}
+        ],
+        "Indices": [
+          "CREATE INDEX idx_titulo_es ON PELICULAS_SERIES(titulo_es)",
+          "CREATE INDEX idx_año ON PELICULAS_SERIES(año_estreno)",
+          "CREATE FULLTEXT INDEX ft_titulos ON PELICULAS_SERIES(titulo_es, titulo_en, titulo_original)"
+        ]
+      },
+      
+      {
+        "Nombre": "EPISODIOS",
+        "Descripcion": "Detalle de episodios para series",
+        "Campos": [
+          {"Nombre": "episodio_id", "Tipo": "INT", "Clave": "Primaria AUTO_INCREMENT"},
+          {"Nombre": "tmdb_id", "Tipo": "INT", "Clave": "Foránea → PELICULAS_SERIES"},
+          {"Nombre": "temporada_numero", "Tipo": "TINYINT"},
+          {"Nombre": "episodio_numero", "Tipo": "TINYINT"},
+          {"Nombre": "titulo_episodio", "Tipo": "VARCHAR(255)"},
+          {"Nombre": "duracion_minutos", "Tipo": "INT"},
+          {"Nombre": "fecha_emision", "Tipo": "DATE"},
+          {"Nombre": "sinopsis", "Tipo": "TEXT"}
+        ],
+        "Indices": [
+          "CREATE UNIQUE INDEX idx_serie_temp_ep ON EPISODIOS(tmdb_id, temporada_numero, episodio_numero)"
+        ]
+      },
+      
+      {
+        "Nombre": "HASHES",
+        "Descripcion": "Huellas perceptuales de referencia",
+        "Campos": [
+          {"Nombre": "hash_id", "Tipo": "BIGINT", "Clave": "Primaria AUTO_INCREMENT"},
+          {"Nombre": "tmdb_id", "Tipo": "INT", "Clave": "Foránea → PELICULAS_SERIES"},
+          {"Nombre": "episodio_id", "Tipo": "INT", "Clave": "Foránea → EPISODIOS", "Nullable": true, "Descripcion": "NULL si es película"},
+          {"Nombre": "tipo_hash", "Tipo": "ENUM('PHASH_VIDEO','CHROMAPRINT_AUDIO','ACOUSTICID')", "Descripcion": "Tipo de huella"},
+          {"Nombre": "huella_valor", "Tipo": "VARCHAR(512)", "Descripcion": "Hash hexadecimal o base64"},
+          {"Nombre": "tiempo_segundos", "Tipo": "INT", "Descripcion": "Timestamp del fotograma/fragmento"},
+          {"Nombre": "resolucion_original", "Tipo": "VARCHAR(20)", "Descripcion": "e.g., '1920x1080' para pHash"},
+          {"Nombre": "fuente_calidad", "Tipo": "VARCHAR(50)", "Descripcion": "BluRay, WEB-DL, etc."},
+          {"Nombre": "fecha_generacion", "Tipo": "DATETIME", "Default": "CURRENT_TIMESTAMP"}
+        ],
+        "Indices": [
+          "CREATE INDEX idx_hash_tipo ON HASHES(tipo_hash, huella_valor(64))",
+          "CREATE INDEX idx_contenido ON HASHES(tmdb_id, episodio_id)"
+        ],
+        "Notas": [
+          "Para pHash, almacenar múltiples hashes por contenido (minuto 2, 5, 10, 15, etc.)",
+          "Para series, SOLO almacenar hashes del episodio específico (no toda la temporada)"
+        ]
+      },
+      
+      {
+        "Nombre": "MAPEO_MUSICBRAINZ_TMDB",
+        "Descripcion": "Relación entre AcoustID/MusicBrainz y TMDb",
+        "Campos": [
+          {"Nombre": "recording_id", "Tipo": "VARCHAR(36)", "Clave": "Primaria", "Descripcion": "UUID de MusicBrainz"},
+          {"Nombre": "tmdb_id", "Tipo": "INT", "Clave": "Foránea → PELICULAS_SERIES"},
+          {"Nombre": "episodio_id", "Tipo": "INT", "Clave": "Foránea → EPISODIOS", "Nullable": true},
+          {"Nombre": "confidence_score", "Tipo": "FLOAT", "Descripcion": "0.0 a 1.0"},
+          {"Nombre": "fecha_verificacion", "Tipo": "DATETIME"}
+        ]
+      }
+    ]
+  },
+
+  "Estructura_Log_Analisis": {
+    "Nombre": "DB_Registro_Analisis",
+    "Tablas": [
+      {
+        "Nombre": "ANALISIS_DE_ARCHIVOS",
+        "Descripcion": "Log forense de cada archivo procesado",
+        "Campos": [
+          {"Nombre": "registro_id", "Tipo": "BIGINT", "Clave": "Primaria AUTO_INCREMENT"},
+          {"Nombre": "hash_archivo_sha256", "Tipo": "VARCHAR(64)", "Indice": "UNIQUE", "Descripcion": "Para detectar duplicados exactos"},
+          {"Nombre": "timestamp_inicio", "Tipo": "DATETIME", "Default": "CURRENT_TIMESTAMP"},
+          {"Nombre": "timestamp_fin", "Tipo": "DATETIME"},
+          {"Nombre": "tiempo_procesamiento_segundos", "Tipo": "INT"},
+          {"Nombre": "ruta_archivo_original", "Tipo": "VARCHAR(1024)"},
+          {"Nombre": "ruta_archivo_final", "Tipo": "VARCHAR(1024)", "Nullable": true},
+          {"Nombre": "nombre_archivo_original", "Tipo": "VARCHAR(255)"},
+          {"Nombre": "tamano_bytes", "Tipo": "BIGINT"},
+          {"Nombre": "duracion_segundos", "Tipo": "INT"},
+          
+          {"Nombre": "capa_0_ejecutada", "Tipo": "BOOLEAN", "Default": false},
+          {"Nombre": "capa_0_candidatos_json", "Tipo": "JSON", "Descripcion": "Array de candidatos de TMDb"},
+          {"Nombre": "capa_0_candidato_principal_tmdb_id", "Tipo": "INT"},
+          {"Nombre": "capa_0_score_fuzzy_match", "Tipo": "FLOAT", "Descripcion": "0.0 a 1.0"},
+          
+          {"Nombre": "capa_1_ejecutada", "Tipo": "BOOLEAN", "Default": false},
+          {"Nombre": "capa_1_score_phash", "Tipo": "FLOAT", "Descripcion": "Porcentaje de coincidencia (0.0 a 1.0)"},
+          {"Nombre": "capa_1_hashes_comparados", "Tipo": "INT"},
+          {"Nombre": "capa_1_mejor_match_hash_id", "Tipo": "BIGINT"},
+          
+          {"Nombre": "capa_2_ejecutada", "Tipo": "BOOLEAN", "Default": false},
+          {"Nombre": "capa_2_acousticid_resultado", "Tipo": "ENUM('CONFIRMADO','REFUTADO','NO_ENCONTRADO','ERROR')", "Nullable": true},
+          {"Nombre": "capa_2_recording_id", "Tipo": "VARCHAR(36)", "Nullable": true},
+          {"Nombre": "capa_2_score", "Tipo": "FLOAT"},
+          
+          {"Nombre": "capa_3_ejecutada", "Tipo": "BOOLEAN", "Default": false},
+          {"Nombre": "capa_3_gemini_prompt", "Tipo": "TEXT"},
+          {"Nombre": "capa_3_gemini_respuesta", "Tipo": "TEXT"},
+          {"Nombre": "capa_3_costo_usd", "Tipo": "DECIMAL(10,6)"},
+          
+          {"Nombre": "resultado_final_tmdb_id", "Tipo": "INT"},
+          {"Nombre": "resultado_final_episodio_id", "Tipo": "INT", "Nullable": true},
+          {"Nombre": "confianza_final", "Tipo": "ENUM('MUY_BAJA','BAJA','MEDIA','ALTA','CONFIRMADO')", "Descripcion": "< 40%, 40-59%, 60-79%, 80-94%, 95%+"},
+          {"Nombre": "clasificacion_resultado", "Tipo": "ENUM('IDENTIFICADO','PROBABLE','DUDOSO','NO_IDENTIFICADO','ERROR')"},
+          
+          {"Nombre": "metadata_actualizada", "Tipo": "BOOLEAN", "Default": false},
+          {"Nombre": "archivo_renombrado", "Tipo": "BOOLEAN", "Default": false},
+          {"Nombre": "archivo_movido", "Tipo": "BOOLEAN", "Default": false},
+          
+          {"Nombre": "falso_positivo_reportado", "Tipo": "BOOLEAN", "Default": false},
+          {"Nombre": "verificacion_manual_requerida", "Tipo": "BOOLEAN", "Default": false},
+          {"Nombre": "notas_log", "Tipo": "TEXT"},
+          {"Nombre": "errores_json", "Tipo": "JSON", "Descripcion": "Array de errores encontrados durante procesamiento"}
+        ],
+        "Indices": [
+          "CREATE INDEX idx_timestamp ON ANALISIS_DE_ARCHIVOS(timestamp_inicio)",
+          "CREATE INDEX idx_resultado ON ANALISIS_DE_ARCHIVOS(resultado_final_tmdb_id)",
+          "CREATE INDEX idx_confianza ON ANALISIS_DE_ARCHIVOS(confianza_final)"
+        ]
+      },
+      
+      {
+        "Nombre": "ARCHIVO_INFO_TECNICA",
+        "Descripcion": "Metadata técnica extraída con ffprobe",
+        "Campos": [
+          {"Nombre": "info_id", "Tipo": "BIGINT", "Clave": "Primaria AUTO_INCREMENT"},
+          {"Nombre": "registro_id", "Tipo": "BIGINT", "Clave": "Foránea → ANALISIS_DE_ARCHIVOS", "Unique": true},
+          
+          {"Nombre": "contenedor", "Tipo": "VARCHAR(20)", "Descripcion": "mkv, mp4, avi"},
+          {"Nombre": "codec_video", "Tipo": "VARCHAR(20)", "Descripcion": "h264, hevc, av1"},
+          {"Nombre": "resolucion_ancho", "Tipo": "INT"},
+          {"Nombre": "resolucion_alto", "Tipo": "INT"},
+          {"Nombre": "calidad_tag", "Tipo": "ENUM('SD','480p','720p','1080p','1440p','4K','8K')"},
+          {"Nombre": "bitrate_video_kbps", "Tipo": "INT"},
+          {"Nombre": "fps", "Tipo": "DECIMAL(6,3)"},
+          {"Nombre": "codec_hdr", "Tipo": "VARCHAR(50)", "Nullable": true, "Descripcion": "HDR10, HDR10+, Dolby Vision"},
+          {"Nombre": "rango_color", "Tipo": "VARCHAR(20)", "Descripcion": "tv, pc"},
+          
+          {"Nombre": "pistas_audio_json", "Tipo": "JSON", "Descripcion": "Ver estructura abajo"},
+          {"Nombre": "pistas_subtitulos_json", "Tipo": "JSON"},
+          {"Nombre": "capitulos_json", "Tipo": "JSON", "Nullable": true},
+          
+          {"Nombre": "ffprobe_completo_json", "Tipo": "JSON", "Descripcion": "Salida raw de ffprobe"},
+          {"Nombre": "fecha_analisis", "Tipo": "DATETIME", "Default": "CURRENT_TIMESTAMP"}
+        ],
+        
+        "Estructura_JSON_Pistas_Audio": {
+          "ejemplo": [
+            {
+              "index": 0,
+              "codec": "aac",
+              "codec_long_name": "AAC (Advanced Audio Coding)",
+              "sample_rate": 48000,
+              "channels": 2,
+              "channel_layout": "stereo",
+              "bitrate_kbps": 192,
+              "idioma_codigo_iso639": "spa",
+              "idioma_etiqueta_original": "spa_s-mx",
+              "idioma_normalizado": "Español (México)",
+              "titulo_pista_original": "Spanish (Latin America)",
+              "titulo_pista_normalizado": "Español (México)",
+              "es_default": true,
+              "es_forced": false,
+              "es_commentary": false
+            },
+            {
+              "index": 1,
+              "codec": "ac3",
+              "channels": 6,
+              "channel_layout": "5.1",
+              "bitrate_kbps": 640,
+              "idioma_codigo_iso639": "eng",
+              "idioma_normalizado": "Inglés",
+              "titulo_pista_normalizado": "Inglés (5.1)",
+              "es_default": false
+            }
+          ]
+        },
+        
+        "Estructura_JSON_Pistas_Subtitulos": {
+          "ejemplo": [
+            {
+              "index": 0,
+              "codec": "subrip",
+              "idioma_codigo_iso639": "spa",
+              "idioma_etiqueta_original": "spa.forced",
+              "idioma_normalizado": "Español (México) - Forzados",
+              "titulo_pista_original": "Spanish Forced",
+              "titulo_pista_normalizado": "Español (México) - Forzados",
+              "es_default": false,
+              "es_forced": true,
+              "es_sdh": false,
+              "es_commentary": false
+            },
+            {
+              "index": 1,
+              "codec": "ass",
+              "idioma_codigo_iso639": "eng",
+              "idioma_normalizado": "Inglés - SDH",
+              "es_sdh": true
+            }
+          ]
+        }
+      },
+      
+      {
+        "Nombre": "CACHE_ACOUSTICID",
+        "Descripcion": "Cache local de consultas a AcoustID API",
+        "Campos": [
+          {"Nombre": "fingerprint_chromaprint", "Tipo": "TEXT", "Clave": "Primaria"},
+          {"Nombre": "duracion_segundos", "Tipo": "INT"},
+          {"Nombre": "resultado_api_json", "Tipo": "JSON"},
+          {"Nombre": "recording_ids", "Tipo": "JSON", "Descripcion": "Array de MusicBrainz IDs encontrados"},
+          {"Nombre": "timestamp_consulta", "Tipo": "DATETIME", "Default": "CURRENT_TIMESTAMP"},
+          {"Nombre": "expiracion", "Tipo": "DATETIME", "Descripcion": "Cache válido por 90 días"}
+        ],
+        "Indices": [
+          "CREATE INDEX idx_expiracion ON CACHE_ACOUSTICID(expiracion)"
+        ]
+      },
+      
+      {
+        "Nombre": "FALSOS_POSITIVOS",
+        "Descripcion": "Registro de detecciones incorrectas para mejorar el sistema",
+        "Campos": [
+          {"Nombre": "fp_id", "Tipo": "BIGINT", "Clave": "Primaria AUTO_INCREMENT"},
+          {"Nombre": "registro_id", "Tipo": "BIGINT", "Clave": "Foránea → ANALISIS_DE_ARCHIVOS"},
+          {"Nombre": "tmdb_id_detectado", "Tipo": "INT", "Descripcion": "Lo que el sistema pensó que era"},
+          {"Nombre": "tmdb_id_real", "Tipo": "INT", "Descripcion": "Lo que realmente es (verificación manual)"},
+          {"Nombre": "capa_responsable", "Tipo": "ENUM('CAPA_0','CAPA_1','CAPA_2','CAPA_3')"},
+          {"Nombre": "razon_error", "Tipo": "TEXT"},
+          {"Nombre": "patron_error", "Tipo": "VARCHAR(255)", "Descripcion": "e.g., 'intro_similar', 'mismo_actor', 'remake'"},
+          {"Nombre": "fecha_reporte", "Tipo": "DATETIME", "Default": "CURRENT_TIMESTAMP"},
+          {"Nombre": "corregido", "Tipo": "BOOLEAN", "Default": false}
+        ]
+      }
+    ]
+  },
+
+  "Diccionario_Idiomas": {
+    "Descripcion": "Mapeo de códigos ISO 639-1/2/3 y variantes a nombres normalizados",
+    "Idiomas_Base": {
+      "spa": "Español",
+      "eng": "Inglés",
+      "por": "Português",
+      "fre": "Français",
+      "fra": "Français",
+      "ger": "Deutsch",
+      "deu": "Deutsch",
+      "ita": "Italiano",
+      "jpn": "日本語",
+      "kor": "한국어",
+      "chi": "中文",
+      "zho": "中文",
+      "rus": "Русский",
+      "ara": "العربية",
+      "hin": "हिन्दी",
+      "cat": "Català",
+      "eus": "Euskara",
+      "glg": "Galego"
+    },
+    
+    "Variantes_Regionales": {
+      "spa_s-es": "Español (España)",
+      "spa_s-mx": "Español (México)",
+      "spa_s-ar": "Español (Argentina)",
+      "spa_s-cl": "Español (Chile)",
+      "spa_s-co": "Español (Colombia)",
+      "eng_s-us": "Inglés (Estados Unidos)",
+      "eng_s-gb": "Inglés (Reino Unido)",
+      "eng_s-au": "Inglés (Australia)",
+      "por_s-br": "Português (Brasil)",
+      "por_s-pt": "Português (Portugal)",
+      "fra_s-fr": "Français (France)",
+      "fra_s-ca": "Français (Canada)",
+      "chi_s-cn": "中文 (简体)",
+      "chi_s-tw": "中文 (繁體)",
+      "zho_s-hans": "中文 (简体)",
+      "zho_s-hant": "中文 (繁體)"
+    },
+    
+    "Sufijos_Especiales": {
+      "forced": "Forzados",
+      "sdh": "Para sordos",
+      "cc": "Closed Captions",
+      "hi": "Para sordos",
+      "commentary": "Comentarios",
+      "descriptive": "Audiodescripción",
+      "signs": "Letreros y señales",
+      "full": "Completo"
+    },
+    
+    "Reglas_Normalizacion": [
+      "Si idioma_etiqueta contiene 'forced' → agregar ' - Forzados'",
+      "Si idioma_etiqueta contiene 'sdh' o 'cc' → agregar ' - SDH'",
+      "Si idioma_etiqueta termina en '_s-XX' → usar variante regional",
+      "Si no hay coincidencia exacta → usar idioma base (spa → Español)",
+      "Priorizar variantes regionales sobre genéricas si están disponibles"
+    ]
+  },
+
+  "Flujo_General_y_Capas": {
+    "Descripcion": "Sistema de detección por capas progresivas con umbrales configurables",
+    
+    "Preprocesamiento": {
+      "Pasos": [
+        "1. Verificar si archivo ya fue procesado (SHA256 en ANALISIS_DE_ARCHIVOS)",
+        "2. Validar extensión y duración mínima",
+        "3. Extraer información técnica con ffprobe (ARCHIVO_INFO_TECNICA)",
+        "4. Calcular SHA256 del archivo completo"
+      ]
+    },
+    
+    "Capa_0_Metadatos_Textuales": {
+      "Nombre": "Identificación por Nombre (TMDb API)",
+      "Prioridad_Ejecucion": 2,
+      "Habilitado": true,
+      "Umbral_Aprobacion": 0.70,
+      "Descripcion": "Búsqueda fuzzy del título en TMDb usando nombre de archivo/carpeta",
+      
+      "Normalizacion_Nombres": {
+        "Pasos": [
+          "1. Extraer información del path completo (carpeta padre puede tener el título)",
+          "2. Remover release tags: [1080p, x264, WEB-DL, HEVC, AAC, etc.]",
+          "3. Convertir a minúsculas",
+          "4. Reemplazar separadores (., _, -) por espacios",
+          "5. Remover caracteres especiales excepto letras, números, espacios",
+          "6. Detectar año con regex: (19|20)\\d{2}",
+          "7. Aplicar correcciones comunes: '3' → 'e' (Ali3n → Alien)",
+          "8. Eliminar stopwords: 'the', 'la', 'el', 'los', 'a', 'an'"
+        ],
+        
+        "Ejemplos_Transformacion": [
+          {
+            "original": "Breaking.Bad.S01E01.720p.BluRay.x264-DEMAND.mkv",
+            "normalizado": "breaking bad",
+            "metadatos_extra": {"temporada": 1, "episodio": 1, "calidad": "720p"}
+          },
+          {
+            "original": "The.Matrix.1999.1080p.BluRay.x265.10bit.HDR.mkv",
+            "normalizado": "matrix",
+            "metadatos_extra": {"año": 1999, "calidad": "1080p"}
+          },
+          {
+            "original": "/media/Películas/Alien (1979)/alien.1979.directors.cut.mkv",
+            "normalizado": "alien directors cut",
+            "metadatos_extra": {"año": 1979, "es_directors_cut": true}
+          }
+        ]
+      },
+      
+      "Estrategia_Busqueda": {
+        "API": "TMDb Search API v3",
+        "Endpoints": {
+          "peliculas": "/search/movie",
+          "series": "/search/tv",
+          "multi": "/search/multi"
+        },
+        
+        "Parametros_Busqueda": {
+          "query": "Título normalizado",
+          "language": "es-MX",
+          "include_adult": false,
+          "year": "Extraído del nombre si está disponible"
+        },
+        
+        "Scoring_Candidatos": [
+          {
+            "criterio": "Similitud Levenshtein con título",
+            "peso": 0.35,
+            "nota": "Usar librería python-Levenshtein"
+          },
+          {
+            "criterio": "Coincidencia de año (±1 año tolerancia)",
+            "peso": 0.20,
+            "nota": "Bonus si el año coincide exactamente"
+          },
+          {
+            "criterio": "Popularidad TMDb (popularity score)",
+            "peso": 0.15,
+            "nota": "Desambiguar entre remakes y versiones"
+          },
+          {
+            "criterio": "Coincidencia con títulos alternativos",
+            "peso": 0.20,
+            "nota": "Buscar en campo 'alternative_titles' de TMDb"
+          },
+          {
+            "criterio": "Duración del archivo vs duración oficial",
+            "peso": 0.10,
+            "nota": "±15% tolerancia"
+          }
+        ],
+        
+        "Score_Total_Formula": "Σ (criterio_score × peso)",
+        "Umbral_Minimo_Pasar": 0.70
+      },
+      
+      "Salida": {
+        "candidatos_ordenados": "Array de hasta 5 mejores matches",
+        "candidato_principal": "El de mayor score",
+        "avanzar_siguiente_capa": "Si score >= 0.70",
+        "terminar_aqui": "Si score >= 0.95 y no hay ambigüedad"
+      },
+      
+      "Casos_Problematicos": [
+        {
+          "problema": "Remakes (ej: 'IT' 1990 vs 2017)",
+          "solucion": "Usar año del archivo + popularidad para desambiguar"
+        },
+        {
+          "problema": "Series con nombres genéricos (ej: 'The Office' US vs UK)",
+          "solucion": "Verificar idioma de audio en Capa 2, o usar país de producción"
+        },
+        {
+          "problema": "Nombres muy modificados (ej: 'BrBa' = 'Breaking Bad')",
+          "solucion": "Base de datos de alias comunes en PELICULAS_SERIES.alias_conocidos"
+        }
+      ]
+    },
+    
+    "Capa_1_Hashing_Perceptual": {
+      "Nombre": "Detección Masiva por Hash Visual (pHash)",
+      "Prioridad_Ejecucion": 1,
+      "Habilitado": true,
+      "Umbral_Aprobacion": 0.60,
+      "Descripcion": "Comparación de huellas visuales de fotogramas clave",
+      
+      "Extraccion_Hashes": {
+        "Herramienta": "ffmpeg + imagehash (Python) o videohash",
+        "Fotogramas_A_Extraer": [
+          {"tiempo_segundos": 120, "razon": "Evitar intro/créditos"},
+          {"tiempo_segundos": 300, "razon": "5 minutos"},
+          {"tiempo_segundos": 600, "razon": "10 minutos"},
+          {"tiempo_segundos": 900, "razon": "15 minutos"},
+          {"porcentaje_duracion": 0.25, "razon": "25% del contenido"},
+          {"porcentaje_duracion": 0.50, "razon": "Punto medio"},
+{"porcentaje_duracion": 0.75, "razon": "75% del contenido"}
+        ],
+        
+        "Comando_Extraccion_Fotograma": "ffmpeg -ss {tiempo} -i {archivo} -vframes 1 -vf scale=320:240 -f image2pipe -vcodec png -",
+        
+        "Algoritmo_Hash": "pHash (Perceptual Hash)",
+        "Libreria_Python": "imagehash.phash()",
+        "Tamano_Hash_Bits": 64,
+        "Descripcion_Tecnica": "Convierte imagen a escala de grises, DCT, toma componentes de baja frecuencia"
+      },
+      
+      "Comparacion_Hashes": {
+        "Metrica_Distancia": "Hamming Distance",
+        "Formula_Similitud": "1 - (hamming_distance / 64)",
+        
+        "Ejemplo_Calculo": {
+          "hash_referencia": "a1b2c3d4e5f6g7h8",
+          "hash_archivo_test": "a1b2c3d4e5f6g7h9",
+          "bits_diferentes": 4,
+          "hamming_distance": 4,
+          "similitud": "1 - (4/64) = 0.9375 = 93.75%"
+        },
+        
+        "Umbral_Match": 0.60,
+        "Umbral_Alta_Confianza": 0.85,
+        "Umbral_Confirmacion_Directa": 0.95
+      },
+      
+      "Estrategia_Peliculas": {
+        "Comparar_Contra": "Todos los hashes de la película candidata (de Capa 0 si existe, sino top 10 populares de DB)",
+        "Minimo_Hashes_Coincidentes": 3,
+        "Score_Final": "Promedio de los 5 mejores matches"
+      },
+      
+      "Estrategia_Series": {
+        "Comparar_Contra": "SOLO hashes del episodio candidato específico (tmdb_id + episodio_id)",
+        "Razon": "Evitar falsos positivos por 'previously on', flashbacks, intro/outro iguales",
+        
+        "Deteccion_Temporada_Episodio": {
+          "Regex_Patrones": [
+            "S(\\d{1,2})E(\\d{1,2})",
+            "(\\d{1,2})x(\\d{1,2})",
+            "Season\\s*(\\d{1,2}).*Episode\\s*(\\d{1,2})"
+          ],
+          "Fallback": "Si no se detecta, usar orden alfabético de archivos en carpeta"
+        },
+        
+        "Validacion_Duracion": {
+          "Descripcion": "Comparar duración del archivo vs duración oficial del episodio",
+          "Tolerancia": "±20% (para versiones extendidas o editadas)",
+          "Accion_Si_Discrepancia": "Reducir confianza en 15%"
+        }
+      },
+      
+      "Optimizaciones": {
+        "Cache_Hashes_Locales": "Guardar pHash de archivos ya procesados en DB local",
+        "Indexacion": "Usar BK-Tree o VP-Tree para búsqueda rápida de hashes similares (opcional)",
+        "Procesamiento_Paralelo": "Extraer fotogramas de múltiples archivos simultáneamente"
+      },
+      
+      "Salida": {
+        "score_phash": "0.0 a 1.0",
+        "hashes_comparados": "Número de comparaciones realizadas",
+        "mejor_match_hash_id": "ID del hash más similar en DB_Huellas_Referencia",
+        "avanzar_siguiente_capa": "Si score >= 0.60",
+        "rechazar_archivo": "Si score < 0.40 (probable basura o contenido desconocido)"
+      },
+      
+      "Mitigacion_Falsos_Positivos": [
+        {
+          "Caso": "Intros/Outros idénticas entre episodios",
+          "Solucion": "Ignorar primeros 2 min y últimos 3 min del archivo",
+          "Implementacion": "Ajustar tiempos de extracción de fotogramas"
+        },
+        {
+          "Caso": "Flashbacks de episodios anteriores",
+          "Solucion": "Requerir al menos 3 fotogramas con >80% similitud",
+          "Implementacion": "No confiar en un solo fotograma coincidente"
+        },
+        {
+          "Caso": "Remakes o versiones (ej: anime original vs live-action)",
+          "Solucion": "Combinar con Capa 0 (año de lanzamiento)",
+          "Implementacion": "Penalizar score si año difiere en >10 años"
+        },
+        {
+          "Caso": "Escenas de acción genéricas (explosiones, persecuciones)",
+          "Solucion": "Evitar fotogramas con alta saturación o movimiento",
+          "Implementacion": "Filtrar fotogramas con variance >umbral"
+        }
+      ]
+    },
+    
+    "Capa_2_Audio_Fingerprint": {
+      "Nombre": "Validación por Huella de Audio (AcoustID)",
+      "Prioridad_Ejecucion": 3,
+      "Habilitado": true,
+      "Umbral_Aprobacion": 0.75,
+      "Condicion_Activacion": "Solo si Capa_1 score >= 0.60 O Capa_0 score >= 0.70",
+      "Descripcion": "Verificación mediante fingerprinting de audio con AcoustID API",
+      
+      "Prerequisitos": {
+        "API_Key": "Obtener gratis en https://acoustid.org/api-key",
+        "Librerias_Requeridas": [
+          "pyacoustid",
+          "chromaprint (fpcalc binary)",
+          "ffmpeg (para extraer audio)"
+        ]
+      },
+      
+      "Extraccion_Audio": {
+        "Comando_FFmpeg": "ffmpeg -i {archivo} -vn -ar 16000 -ac 1 -f wav -t 120 -",
+        "Parametros": {
+          "vn": "Sin video",
+          "ar": "16000 Hz (suficiente para fingerprint)",
+          "ac": "1 canal (mono)",
+          "t": "120 segundos (2 minutos - suficiente para identificación)",
+          "f": "Formato WAV para Chromaprint"
+        },
+        
+        "Segmentos_A_Analizar": [
+          {"inicio_seg": 120, "duracion_seg": 60, "razon": "Evitar intro"},
+          {"inicio_seg": 300, "duracion_seg": 60, "razon": "Escena principal"},
+          {"inicio_seg": 600, "duracion_seg": 60, "razon": "Punto medio"}
+        ]
+      },
+      
+      "Generacion_Fingerprint": {
+        "Herramienta": "Chromaprint (fpcalc)",
+        "Comando": "fpcalc -raw -json {audio_file}",
+        "Salida": {
+          "duration": "Duración en segundos",
+          "fingerprint": "String comprimido base64"
+        },
+        
+        "Cache_Local": {
+          "Tabla": "CACHE_ACOUSTICID",
+          "Verificar_Antes_API": true,
+          "Tiempo_Expiracion_Dias": 90,
+          "Razon": "Evitar llamadas repetidas a API para mismo contenido"
+        }
+      },
+      
+      "Consulta_AcoustID_API": {
+        "Endpoint": "https://api.acoustid.org/v2/lookup",
+        "Metodo": "POST",
+        "Parametros": {
+          "client": "{API_KEY}",
+          "duration": "{duracion_segundos}",
+          "fingerprint": "{fingerprint_chromaprint}",
+          "meta": "recordings releasegroups compress"
+        },
+        
+        "Rate_Limiting": {
+          "Limite_Por_Segundo": 3,
+          "Implementacion_Recomendada": 2.2,
+          "Margen_Seguridad": "27% buffer",
+          "Mecanismo": "threading.Semaphore(2) + time.sleep(0.45)",
+          "Manejo_Errores": {
+            "429_Too_Many_Requests": "Esperar 60 segundos, reintentar",
+            "503_Service_Unavailable": "Reintentar 3 veces con backoff exponencial",
+            "Timeout": "Timeout de 30 segundos por request"
+          }
+        },
+        
+        "Procesamiento_Respuesta": {
+          "Estructura_JSON": {
+            "status": "ok",
+            "results": [
+              {
+                "id": "recording_id (MusicBrainz UUID)",
+                "score": 0.95,
+                "recordings": [
+                  {
+                    "id": "uuid",
+                    "title": "Nombre de la pista/episodio",
+                    "duration": 3600
+                  }
+                ]
+              }
+            ]
+          },
+          
+          "Validacion_Match": [
+            "1. Verificar que score >= 0.75",
+            "2. Obtener recording_id del mejor resultado",
+            "3. Buscar recording_id en tabla MAPEO_MUSICBRAINZ_TMDB",
+            "4. Comparar tmdb_id obtenido con candidato de Capa 0/1",
+            "5. Si coincide → CONFIRMADO, si difiere → REFUTADO"
+          ]
+        }
+      },
+      
+      "Mapeo_MusicBrainz_TMDb": {
+        "Descripcion": "Relación entre recording_id de AcoustID y tmdb_id",
+        "Estrategias_Poblacion": [
+          {
+            "Metodo": "Manual",
+            "Descripcion": "Agregar manualmente IDs verificados",
+            "Confianza": "ALTA"
+          },
+          {
+            "Metodo": "Crowdsourcing",
+            "Descripcion": "Permitir a usuarios confirmar matches correctos",
+            "Confianza": "MEDIA (requiere >3 confirmaciones)"
+          },
+          {
+            "Metodo": "Heurística",
+            "Descripcion": "Si AcoustID.title coincide fuzzy con TMDb.title → agregar con baja confianza",
+            "Confianza": "BAJA (requiere verificación posterior)"
+          }
+        ]
+      },
+      
+      "Salida": {
+        "acoustid_resultado": "CONFIRMADO | REFUTADO | NO_ENCONTRADO | ERROR",
+        "recording_id": "UUID de MusicBrainz si existe",
+        "score": "0.0 a 1.0",
+        "avanzar_siguiente_capa": "Si resultado = REFUTADO o NO_ENCONTRADO (y Capa 1 >= 0.60)",
+        "confirmar_identificacion": "Si resultado = CONFIRMADO y score >= 0.85"
+      },
+      
+      "Mitigacion_Falsos_Negativos": [
+        {
+          "Caso": "Audio en idioma diferente al original",
+          "Problema": "Doblaje español vs audio original inglés",
+          "Solucion": "Analizar TODAS las pistas de audio disponibles",
+          "Implementacion": "Iterar sobre info_tecnica.pistas_audio_json y procesar cada una"
+        },
+        {
+          "Caso": "Audio recodificado con pérdida",
+          "Problema": "Compresión agresiva distorsiona el fingerprint",
+          "Solucion": "Usar múltiples segmentos de audio (inicio, medio, final)",
+          "Implementacion": "Si primer segmento falla, probar con los otros"
+        },
+        {
+          "Caso": "Contenido muy nuevo sin registro en AcoustID",
+          "Problema": "Películas/series recién estrenadas no están en la base",
+          "Solucion": "NO penalizar, marcar como NO_ENCONTRADO (no como error)",
+          "Implementacion": "Confiar en Capa 1 + Capa 3 para estos casos"
+        }
+      ]
+    },
+    
+    "Capa_3_Verificacion_IA": {
+      "Nombre": "Verificación con IA Multimodal (Gemini)",
+      "Prioridad_Ejecucion": 4,
+      "Habilitado": true,
+      "Condicion_Activacion": "Solo si (Capa_1 >= 0.60 Y Capa_2 = REFUTADO) O (Capa_0 >= 0.70 Y Capa_1 < 0.60)",
+      "Descripcion": "Último recurso: análisis visual con IA cuando otras capas fallan",
+      
+      "Modelo_Recomendado": {
+        "Nombre": "Gemini 1.5 Flash",
+        "Razon": "Más barato que Pro, suficiente para identificación",
+        "Costo_Aproximado": "$0.075 por 1M input tokens, $0.30 por 1M output tokens",
+        "Costo_Por_Analisis": "~$0.002 - $0.005 USD (2-5 imágenes + prompt)"
+      },
+      
+      "Extraccion_Fotogramas_IA": {
+        "Cantidad": "3-5 fotogramas estratégicos",
+        "Posiciones": [
+          {"tiempo_seg": 180, "razon": "Escena establecida (post-intro)"},
+          {"porcentaje": 0.33, "razon": "Primer acto"},
+          {"porcentaje": 0.50, "razon": "Punto medio (clímax típico)"},
+          {"porcentaje": 0.66, "razon": "Tercer acto"},
+          {"tiempo_final_menos": 600, "razon": "Pre-créditos finales"}
+        ],
+        
+        "Criterios_Seleccion_Inteligente": [
+          "Evitar fotogramas completamente negros o fundidos",
+          "Preferir fotogramas con rostros visibles (usar detección facial simple)",
+          "Evitar fotogramas con mucho texto (créditos)",
+          "Buscar fotogramas con buena iluminación y contraste"
+        ],
+        
+        "Formato": "JPEG comprimido (85% calidad) para reducir costos de tokens",
+        "Resolucion_Maxima": "1024x576 (suficiente para análisis)"
+      },
+      
+      "Prompt_Engineering": {
+        "Prompt_Base": "Eres un experto en identificación de contenido audiovisual. Analiza las siguientes imágenes de una película o serie de TV y determina de qué contenido se trata.\n\n**Contexto adicional:**\n- Candidato propuesto: {titulo_candidato} ({año})\n- Tipo: {MOVIE o TV}\n{si_serie: '- Temporada {X}, Episodio {Y}'}\n- Duración del archivo: {duracion} minutos\n- Idioma de audio detectado: {idioma}\n\n**Tu tarea:**\n1. Analiza cuidadosamente cada fotograma\n2. Identifica elementos visuales distintivos (actores, escenografía, vestuario, estilo cinematográfico)\n3. Determina si las imágenes corresponden al candidato propuesto\n4. Si NO coincide, sugiere el título correcto si lo reconoces\n\n**Responde SOLO en formato JSON:**\n```json\n{\n  \"es_el_candidato\": true/false,\n  \"confianza\": 0.0-1.0,\n  \"titulo_identificado\": \"Nombre exacto si lo reconoces\",\n  \"año_aproximado\": 2024,\n  \"evidencias\": [\"Actor X visible en fotograma 2\", \"Escenografía característica de...\"],\n  \"razon_descarte\": \"Por qué NO es el candidato (si aplica)\"\n}\n```\n\n**IMPORTANTE:** NO respondas nada fuera del JSON. NO uses markdown. Solo JSON válido.",
+        
+        "Prompt_Series_Especifico": "**Advertencia especial para series:**\nLas series pueden tener:\n- Intros/outros idénticas entre episodios\n- Flashbacks de episodios anteriores\n- Escenas recurrentes (misma locación, mismo reparto)\n\nBasa tu análisis en la NARRATIVA visible, no solo en elementos visuales genéricos.",
+        
+        "Ejemplo_Prompt_Completo": "Ver ejemplo en sección de implementación"
+      },
+      
+      "Procesamiento_Respuesta_IA": {
+        "Parseo_JSON": {
+          "Manejo_Errores": [
+            "Eliminar markdown (```json y ```)",
+            "Buscar JSON con regex si la IA agregó texto adicional",
+            "Reintentar con prompt más estricto si falla el parseo"
+          ]
+        },
+        
+        "Validacion_Respuesta": {
+          "Campos_Requeridos": ["es_el_candidato", "confianza"],
+          "Confianza_Minima_Aceptable": 0.70,
+          "Accion_Si_Baja_Confianza": "Marcar para revisión manual"
+        },
+        
+        "Interpretacion_Resultados": {
+          "es_el_candidato_true_Y_confianza_>=_0.85": "CONFIRMAR identificación",
+          "es_el_candidato_false_Y_titulo_identificado_presente": "Actualizar candidato y re-procesar Capa 0",
+          "confianza_<_0.70": "Marcar como DUDOSO, requerir verificación manual",
+          "error_o_timeout": "Marcar como ERROR, no bloquear procesamiento"
+        }
+      },
+      
+      "Control_Costos": {
+        "Presupuesto_Mensual_Sugerido": "$10-50 USD",
+        "Estimacion_Uso": {
+          "Archivos_Nuevos_Mes": 500,
+          "Porcentaje_Requiere_Gemini": "10-15%",
+          "Archivos_Procesados_Gemini": "50-75/mes",
+          "Costo_Total_Estimado": "$0.10 - $0.40 USD/mes"
+        },
+        
+        "Mecanismos_Limite": {
+          "Max_Llamadas_Dia": 100,
+          "Max_Llamadas_Mes": 1000,
+          "Accion_Si_Excede": "Marcar archivos restantes para procesamiento manual"
+        }
+      },
+      
+      "Salida": {
+        "gemini_confirmado": "true/false",
+        "gemini_confianza": "0.0 a 1.0",
+        "gemini_titulo_alternativo": "Si la IA sugirió otro título",
+        "costo_usd": "Costo real de la llamada a la API",
+        "confirmar_identificacion": "Si es_el_candidato = true Y confianza >= 0.85",
+        "requiere_verificacion_manual": "Si confianza < 0.70"
+      }
+    }
+  },
+
+  "Umbrales_Y_Decision_Final": {
+    "Descripcion": "Lógica de decisión basada en scores de todas las capas ejecutadas",
+    
+    "Escenarios_Decision": [
+      {
+        "Escenario": "Identificación de Alta Confianza",
+        "Condiciones": "Capa_1 >= 0.85 Y Capa_2 = CONFIRMADO",
+        "Accion": "IDENTIFICADO - Proceder con normalización automática",
+        "Confianza_Final": "CONFIRMADO",
+        "Verificacion_Manual": false
+      },
+      {
+        "Escenario": "Identificación Confiable",
+        "Condiciones": "(Capa_0 >= 0.80 Y Capa_1 >= 0.70) O (Capa_1 >= 0.75 Y Capa_2 = CONFIRMADO)",
+        "Accion": "IDENTIFICADO - Proceder con normalización",
+        "Confianza_Final": "ALTA",
+        "Verificacion_Manual": false
+      },
+      {
+        "Escenario": "Identificación Probable",
+        "Condiciones": "Capa_1 >= 0.60 Y (Capa_0 >= 0.70 O Capa_2 = CONFIRMADO)",
+        "Accion": "PROBABLE - Normalizar pero marcar para revisión posterior",
+        "Confianza_Final": "MEDIA",
+        "Verificacion_Manual": "recomendada"
+      },
+      {
+        "Escenario": "Identificación Dudosa",
+        "Condiciones": "Capa_1 >= 0.60 Y Capa_2 = REFUTADO Y Capa_3.confianza < 0.70",
+        "Accion": "DUDOSO - Mover a cuarentena para revisión manual",
+        "Confianza_Final": "BAJA",
+        "Verificacion_Manual": true
+      },
+      {
+        "Escenario": "No Identificado",
+        "Condiciones": "Capa_1 < 0.40 Y Capa_0 < 0.50",
+        "Accion": "NO_IDENTIFICADO - Mover a carpeta de archivos desconocidos",
+        "Confianza_Final": "MUY_BAJA",
+        "Verificacion_Manual": true
+      },
+      {
+        "Escenario": "Gemini Override",
+        "Condiciones": "Capa_3.es_el_candidato = false Y Capa_3.confianza >= 0.85 Y Capa_3.titulo_identificado presente",
+        "Accion": "REIDENTIFICAR - Usar título de Gemini como nuevo candidato, volver a Capa_0",
+        "Confianza_Final": "MEDIA",
+        "Verificacion_Manual": "recomendada"
+      }
+    ],
+    
+    "Calculo_Score_Final": {
+      "Formula": "weighted_average = (Capa_0 × 0.20) + (Capa_1 × 0.50) + (Capa_2 × 0.20) + (Capa_3 × 0.10)",
+      "Nota": "Solo incluir capas que fueron ejecutadas. Ajustar pesos proporcionalmente",
+      
+      "Ajustes_Especiales": [
+        {
+          "Condicion": "Capa_2 = CONFIRMADO",
+          "Ajuste": "+15% al score final",
+          "Razon": "Audio fingerprint es muy confiable"
+        },
+        {
+          "Condicion": "Capa_2 = REFUTADO",
+          "Ajuste": "-20% al score final",
+          "Razon": "Refutación activa es señal fuerte de falso positivo"
+        },
+        {
+          "Condicion": "Diferencia de año > 5 años entre archivo y candidato",
+          "Ajuste": "-10% al score final",
+          "Razon": "Probable confusión con remake o versión diferente"
+        },
+        {
+          "Condicion": "Duración difiere >25% de lo esperado",
+          "Ajuste": "-15% al score final",
+          "Razon": "Puede ser versión editada o contenido diferente"
+        }
+      ]
+    },
+    
+    "Mapeo_Score_A_Confianza": {
+      "0.00_a_0.39": "MUY_BAJA",
+      "0.40_a_0.59": "BAJA",
+      "0.60_a_0.79": "MEDIA",
+      "0.80_a_0.94": "ALTA",
+      "0.95_a_1.00": "CONFIRMADO"
+    }
+  },
+
+  "Deteccion_Falsos_Positivos": {
+    "Descripcion": "Mecanismos para identificar y prevenir detecciones incorrectas",
+    
+    "Patrones_Comunes_FP": [
+      {
+        "Patron": "intro_identica",
+        "Descripcion": "Intro/Outro de serie detectada en episodio incorrecto",
+        "Señales": [
+          "Capa_1 score alto SOLO en primeros/últimos 3 minutos",
+          "Múltiples fotogramas intermedios con score <0.30"
+        ],
+        "Mitigacion": "Ignorar primeros 180seg y últimos 180seg al calcular pHash"
+      },
+      {
+        "Patron": "flashback_episodio_previo",
+        "Descripcion": "Flashback extenso de episodio anterior",
+        "Señales": [
+          "Capa_1 detecta episodio S01E05 pero archivo es S01E06",
+          "Solo 1-2 fotogramas coinciden fuertemente"
+        ],
+        "Mitigacion": "Requerir >=40% de fotogramas con score >0.75"
+      },
+      {
+        "Patron": "mismo_actor_serie_diferente",
+        "Descripcion": "Actor protagonista en múltiples series",
+        "Señales": [
+          "Capa_0 sugiere 'Serie A' pero Capa_1 sugiere 'Serie B'",
+          "Ambas series con mismo actor principal"
+        ],
+        "Mitigacion": "Dar más peso a Capa_2 (audio) para desambiguar"
+      },
+      {
+        "Patron": "remake_o_adaptacion",
+        "Descripcion": "Versión diferente del mismo contenido",
+        "Señales": [
+          "Capa_0 detecta 'The Office US' pero archivo es 'The Office UK'",
+          "Diferencia de años >3"
+        ],
+        "Mitigacion": "Capa_2 (idioma de audio) + metadata de país de producción"
+      },
+      {
+        "Patron": "pelicula_vs_serie_basada",
+        "Descripcion": "Película detectada como serie (o viceversa)",
+        "Señales": [
+          "tipo_contenido difiere entre Capa_0 y estructura de archivo",
+          "Duración no coincide con formato típico"
+        ],
+        "Mitigacion": "Validar tipo_contenido contra duración y naming pattern"
+      },
+      {
+        "Patron": "trailer_vs_contenido_completo",
+        "Descripcion": "Trailer detectado como película completa",
+        "Señales": [
+          "Duración < 10 minutos pero Capa_1 score >0.70",
+          "Archivo nombrado con 'trailer' o 'teaser'"
+        ],
+        "Mitigacion": "Rechazar archivos <50 minutos automáticamente"
+      },
+      {
+        "Patron": "contenido_compilado",
+        "Descripcion": "Múltiples episodios concatenados",
+        "Señales": [
+          "Duración = 2-3x lo esperado para un episodio",
+          "pHash detecta múltiples episodios diferentes en mismo archivo"
+        ],
+        "Mitigacion": "Marcar para división manual o procesamiento especial"
+      }
+    ],
+    
+    "Sistema_Deteccion_Automatica": {
+      "Reglas_Heuristicas": [
+        {
+          "Regla": "discrepancia_capas",
+          "Descripcion": "Si Capa_0, Capa_1 y Capa_2 sugieren contenido diferente",
+          "Umbral": "2+ capas en desacuerdo",
+          "Accion": "Marcar como DUDOSO, requiere verificación manual"
+        },
+        {
+          "Regla": "score_bipolar",
+          "Descripcion": "Score muy alto en algunos fotogramas, muy bajo en otros",
+          "Umbral": "Desviación estándar de scores >0.30",
+          "Accion": "Posible flashback o contenido mixto, reducir confianza -20%"
+        },
+        {
+          "Regla": "metadata_inconsistente",
+          "Descripcion": "Metadata técnica no coincide con lo esperado",
+          "Ejemplos": [
+            "Película 4K de 1985 (improbable)",
+            "Serie con audio 5.1 DTS-HD pero año 1990"
+          ],
+          "Accion": "Reducir confianza -10%, validar fecha de lanzamiento"
+        }
+      ],
+      
+      "Aprendizaje_De_Errores": {
+        "Descripcion": "Sistema para mejorar detección basado en correcciones manuales",
+        "Tabla": "FALSOS_POSITIVOS",
+        
+        "Proceso": [
+          "1. Usuario marca resultado como incorrecto en interfaz",
+          "2. Sistema registra en FALSOS_POSITIVOS con patrón de error",
+          "3. Analizar patrones comunes cada 100 registros",
+          "4. Ajustar umbrales o agregar reglas heurísticas",
+          "5. Re-procesar archivos similares con nueva lógica"
+        ],
+        
+        "Metricas_Calidad": {
+          "Precision": "TP / (TP + FP)",
+          "Recall": "TP / (TP + FN)",
+          "F1_Score": "2 × (Precision × Recall) / (Precision + Recall)",
+          "Meta_Precision": ">95%",
+          "Meta_Recall": ">90%"
+        }
+      }
+    },
+    
+    "Validacion_Cruzada": {
+      "Descripcion": "Verificaciones adicionales para reducir FP",
+      
+      "Checks": [
+        {
+          "Check": "validacion_duracion",
+          "Descripcion": "Duración del archivo vs duración oficial",
+          "Tolerancia_Peliculas": "±15 minutos",
+          "Tolerancia_Series": "±10 minutos o ±20%",
+          "Accion_Si_Excede": "Reducir confianza -15%"
+        },
+        {
+          "Check": "validacion_año_tecnologia",
+          "Descripcion": "Coherencia entre año de lanzamiento y calidad técnica",
+          "Ejemplos_Incoherentes": [
+            "Película de 1975 en 4K HDR (imposible sin remasterización)",
+            "Serie de 1990 con Dolby Atmos (tecnología de 2012+)"
+          ],
+"Accion": "Advertencia en log, no bloquear pero reducir confianza -5%"
+        },
+        {
+          "Check": "validacion_idioma_pais",
+          "Descripcion": "Idioma de audio coherente con país de producción",
+          "Ejemplos": [
+            "Serie coreana con solo audio español → posible doblaje o error",
+            "Película japonesa con solo audio inglés → posible versión internacional"
+          ],
+          "Accion": "Validar en Capa_3 si hay duda, o confiar en metadata de TMDb"
+        },
+        {
+          "Check": "validacion_resolucion_fecha",
+          "Descripcion": "Resolución plausible para fecha de lanzamiento",
+          "Reglas": {
+            "antes_2000": "max 720p (DVDRip era estándar)",
+            "2000_2008": "max 1080p (HD llegó ~2006)",
+            "2009_2015": "1080p común, 4K raro",
+            "2016_adelante": "4K/HDR plausible"
+          },
+          "Excepcion": "Remasterizaciones (buscar 'remaster' en título)",
+          "Accion_Si_Incoherente": "Marcar 'posible_remasterizacion' en log"
+        }
+      ]
+    }
+  },
+
+  "Modulo_Normalizacion_Metadata": {
+    "Descripcion": "Actualización de metadata en archivos de video sin recodificar",
+    "Habilitado_Por_Defecto": true,
+    
+    "Herramientas": {
+      "Principal": "ffmpeg con flag -c copy (stream copy, sin recodificación)",
+      "Alternativa": "mkvpropedit (solo para archivos MKV, más rápido)",
+      "Libreria_Python": "ffmpeg-python o subprocess"
+    },
+    
+    "Normalizacion_Pistas_Audio": {
+      "Objetivo": "Renombrar pistas de audio con nombres legibles y coherentes",
+      
+      "Proceso": [
+        {
+          "Paso": 1,
+          "Accion": "Leer metadata actual con ffprobe",
+          "Comando": "ffprobe -v quiet -print_format json -show_streams {archivo}"
+        },
+        {
+          "Paso": 2,
+          "Accion": "Analizar cada stream de audio",
+          "Datos_Extraer": [
+            "index (posición de la pista)",
+            "codec_name",
+            "channels",
+            "tags.language (código ISO 639)",
+            "tags.title (nombre actual de la pista)",
+            "disposition.default",
+            "disposition.forced"
+          ]
+        },
+        {
+          "Paso": 3,
+          "Accion": "Normalizar código de idioma",
+          "Algoritmo": [
+            "Extraer código ISO base (spa, eng, etc.)",
+            "Buscar variante regional en etiqueta (_s-mx, _s-es, etc.)",
+            "Mapear a nombre legible usando Diccionario_Idiomas",
+            "Detectar sufijos especiales (commentary, descriptive, etc.)"
+          ],
+          "Ejemplo_Transformacion": {
+            "Original": {"language": "spa", "title": "spa_s-mx"},
+            "Normalizado": {"language": "spa", "title": "Español (México)"}
+          }
+        },
+        {
+          "Paso": 4,
+          "Accion": "Agregar información técnica al título",
+          "Formato": "{Idioma} ({Info_Tecnica})",
+          "Ejemplos": [
+            "Español (México) - 5.1",
+            "Inglés - Dolby Atmos",
+            "Español (España) - Comentarios del Director",
+            "Francés - 2.0 Estéreo"
+          ]
+        },
+        {
+          "Paso": 5,
+          "Accion": "Generar comando ffmpeg",
+          "Template": "ffmpeg -i {input} -map 0 -c copy {metadata_params} {output}",
+          "Metadata_Params_Ejemplo": [
+            "-metadata:s:a:0 language=spa",
+            "-metadata:s:a:0 title='Español (México) - 5.1'",
+            "-metadata:s:a:1 language=eng",
+            "-metadata:s:a:1 title='Inglés - Dolby Atmos'"
+          ]
+        }
+      ],
+      
+      "Reglas_Especiales": [
+        {
+          "Regla": "preservar_pista_default",
+          "Descripcion": "Mantener la pista marcada como 'default' en su posición",
+          "Implementacion": "Agregar -disposition:a:{index} default al comando"
+        },
+        {
+          "Regla": "detectar_commentary",
+          "Descripcion": "Identificar pistas de comentarios",
+          "Señales": [
+            "title contiene 'commentary', 'comentario', 'director'",
+            "bitrate inusualmente bajo (<96kbps)",
+            "última pista de audio en el archivo"
+          ],
+          "Accion": "Agregar sufijo ' - Comentarios' al título normalizado"
+        },
+        {
+          "Regla": "detectar_descriptive",
+          "Descripcion": "Identificar audiodescripción para ciegos",
+          "Señales": ["title contiene 'descriptive', 'audiodescription', 'AD'"],
+          "Accion": "Agregar sufijo ' - Audiodescripción'"
+        }
+      ],
+      
+      "Ejemplo_Completo": {
+        "Entrada": {
+          "streams": [
+            {
+              "index": 1,
+              "codec_name": "aac",
+              "channels": 2,
+              "tags": {
+                "language": "spa",
+                "title": "spa_s-mx"
+              }
+            },
+            {
+              "index": 2,
+              "codec_name": "ac3",
+              "channels": 6,
+              "tags": {
+                "language": "eng",
+                "title": "English 5.1"
+              }
+            }
+          ]
+        },
+        "Comando_Generado": "ffmpeg -i input.mkv -map 0 -c copy -metadata:s:a:0 language=spa -metadata:s:a:0 title='Español (México) - Estéreo' -metadata:s:a:1 language=eng -metadata:s:a:1 title='Inglés - 5.1' output.mkv",
+        "Salida": {
+          "streams": [
+            {
+              "index": 1,
+              "codec_name": "aac",
+              "channels": 2,
+              "tags": {
+                "language": "spa",
+                "title": "Español (México) - Estéreo"
+              }
+            },
+            {
+              "index": 2,
+              "codec_name": "ac3",
+              "channels": 6,
+              "tags": {
+                "language": "eng",
+                "title": "Inglés - 5.1"
+              }
+            }
+          ]
+        }
+      }
+    },
+    
+    "Normalizacion_Pistas_Subtitulos": {
+      "Objetivo": "Renombrar subtítulos con información clara sobre tipo e idioma",
+      
+      "Proceso_Similar_Audio": "Ver Normalizacion_Pistas_Audio - mismo flujo",
+      
+      "Tipos_Subtitulos": [
+        {
+          "Tipo": "Normal",
+          "Descripcion": "Subtítulos estándar",
+          "Formato_Titulo": "{Idioma}",
+          "Ejemplo": "Español (México)"
+        },
+        {
+          "Tipo": "Forzados",
+          "Descripcion": "Solo diálogos en idioma extranjero o señales",
+          "Señales_Deteccion": [
+            "title contiene 'forced', 'forzado'",
+            "disposition.forced = 1",
+            "tamaño muy pequeño (<100KB para película completa)"
+          ],
+          "Formato_Titulo": "{Idioma} - Forzados",
+          "Ejemplo": "Español (México) - Forzados"
+        },
+        {
+          "Tipo": "SDH",
+          "Descripcion": "Subtítulos para sordos (incluyen efectos de sonido)",
+          "Señales_Deteccion": ["title contiene 'sdh', 'cc', 'hi'"],
+          "Formato_Titulo": "{Idioma} - SDH",
+          "Ejemplo": "Inglés - SDH"
+        },
+        {
+          "Tipo": "Signs",
+          "Descripcion": "Solo letreros y señales visibles",
+          "Señales_Deteccion": ["title contiene 'signs', 'señales'"],
+          "Formato_Titulo": "{Idioma} - Letreros",
+          "Ejemplo": "Inglés - Letreros"
+        }
+      ],
+      
+      "Combinaciones_Especiales": {
+        "Forzados_Y_Completos": {
+          "Situacion": "Archivo tiene 2 pistas de subtítulos en mismo idioma",
+          "Ejemplo": [
+            "Pista 0: spa (pequeño) → 'Español - Forzados'",
+            "Pista 1: spa (normal) → 'Español - Completo'"
+          ]
+        }
+      },
+      
+      "Comando_Ejemplo": "ffmpeg -i input.mkv -map 0 -c copy -metadata:s:s:0 language=spa -metadata:s:s:0 title='Español (México) - Forzados' -metadata:s:s:1 language=spa -metadata:s:s:1 title='Español (México)' -metadata:s:s:2 language=eng -metadata:s:s:2 title='Inglés - SDH' output.mkv"
+    },
+    
+    "Insercion_Metadata_General": {
+      "Descripcion": "Agregar metadata a nivel de archivo (no solo pistas)",
+      
+      "Campos_A_Insertar": [
+        {
+          "Campo": "title",
+          "Valor": "Título oficial del contenido (de TMDb)",
+          "Ejemplo": "Breaking Bad S01E01 - Pilot"
+        },
+        {
+          "Campo": "show",
+          "Valor": "Nombre de la serie (solo para TV)",
+          "Ejemplo": "Breaking Bad"
+        },
+        {
+          "Campo": "season_number",
+          "Valor": "Número de temporada (solo para TV)",
+          "Ejemplo": "1"
+        },
+        {
+          "Campo": "episode_id",
+          "Valor": "Identificador del episodio",
+          "Ejemplo": "S01E01"
+        },
+        {
+          "Campo": "episode_sort",
+          "Valor": "Número de episodio (para ordenamiento)",
+          "Ejemplo": "1"
+        },
+        {
+          "Campo": "year",
+          "Valor": "Año de estreno",
+          "Ejemplo": "2008"
+        },
+        {
+          "Campo": "genre",
+          "Valor": "Géneros separados por coma",
+          "Ejemplo": "Drama, Crime, Thriller"
+        },
+        {
+          "Campo": "synopsis / description",
+          "Valor": "Sinopsis del episodio/película",
+          "Ejemplo": "Walter White, a struggling high school chemistry teacher..."
+        },
+        {
+          "Campo": "comment",
+          "Valor": "Información de procesamiento",
+          "Ejemplo": "Procesado por ContentID - Confianza: ALTA - TMDb ID: 1396"
+        }
+      ],
+      
+      "Comando_Ejemplo": "ffmpeg -i input.mkv -map 0 -c copy -metadata title='Breaking Bad S01E01 - Pilot' -metadata show='Breaking Bad' -metadata year='2008' -metadata episode_id='S01E01' -metadata genre='Drama, Crime' output.mkv"
+    },
+    
+    "Consideraciones_Tecnicas": {
+      "Tiempo_Procesamiento": "1-5 segundos por archivo (solo copia de metadata)",
+      "Sin_Perdida_Calidad": "El flag -c copy NO recodifica, solo actualiza headers",
+      "Compatibilidad": {
+        "MKV": "Soporte completo para metadata rica",
+        "MP4": "Soporte limitado (usa átomos MP4 estándar)",
+        "AVI": "Soporte muy limitado (considerar convertir a MKV)"
+      },
+      
+      "Backup_Recomendado": {
+        "Opcion_1_Conservador": "Crear copia del archivo original antes de modificar",
+        "Opcion_2_Eficiente": "Solo registrar SHA256 en DB para poder revertir si es necesario",
+        "Opcion_3_Arriesgado": "Modificar in-place sin backup (usar solo si hay respaldo externo)"
+      },
+      
+      "Manejo_Errores": [
+        {
+          "Error": "archivo_bloqueado",
+          "Causa": "Archivo siendo reproducido o usado por otro proceso",
+          "Solucion": "Reintentar después de 30 segundos, máximo 3 intentos"
+        },
+        {
+          "Error": "permisos_insuficientes",
+          "Causa": "No hay permisos de escritura",
+          "Solucion": "Registrar en log, marcar para procesamiento manual"
+        },
+        {
+          "Error": "contenedor_incompatible",
+          "Causa": "AVI u otro formato que no soporta metadata extensa",
+          "Solucion": "Ofrecer remuxear a MKV (sin recodificar: ffmpeg -i input.avi -c copy output.mkv)"
+        }
+      ]
+    }
+  },
+
+  "Modulo_Renombrado_Jellyfin": {
+    "Descripcion": "Renombrado de archivos según convenciones de Jellyfin/Plex/Emby",
+    "Habilitado_Por_Defecto": true,
+    
+    "Convenciones_Jellyfin": {
+      "Documentacion_Oficial": "https://jellyfin.org/docs/general/server/media/movies.html",
+      
+      "Peliculas": {
+        "Estructura_Carpetas": "/Movies/{Título} ({Año})/",
+        "Nombre_Archivo": "{Título} ({Año}){Metadata_Opcional}.{ext}",
+        "Metadata_Opcional": " - {Calidad}{HDR}{Audio}{Edicion}",
+        
+        "Ejemplos": [
+          "/Movies/Alien (1979)/Alien (1979).mkv",
+          "/Movies/Alien (1979)/Alien (1979) - 4K HDR.mkv",
+          "/Movies/The Matrix (1999)/The Matrix (1999) - 1080p.mkv",
+          "/Movies/Blade Runner (1982)/Blade Runner (1982) - Director's Cut.mkv"
+        ],
+        
+        "Componentes_Opcionales": {
+          "Calidad": "SD | 480p | 720p | 1080p | 1440p | 4K | 8K",
+          "HDR": "HDR | HDR10 | HDR10+ | Dolby Vision | HLG",
+          "Audio": "Dolby Atmos | DTS:X | DTS-HD MA | TrueHD",
+          "Edicion": "Director's Cut | Extended | Theatrical | Unrated | IMAX"
+        },
+        
+        "Orden_Componentes": "{Calidad} {HDR} {Audio} {Edicion}",
+        "Ejemplo_Completo": "Dune (2021) - 4K HDR10+ Dolby Atmos IMAX.mkv"
+      },
+      
+      "Series": {
+        "Estructura_Carpetas": "/TV Shows/{Título} ({Año})/Season {XX}/",
+        "Nombre_Archivo": "{Título} S{XX}E{YY}{Metadata_Opcional}.{ext}",
+        
+        "Ejemplos": [
+          "/TV Shows/Breaking Bad (2008)/Season 01/Breaking Bad S01E01.mkv",
+          "/TV Shows/Game of Thrones (2011)/Season 03/Game of Thrones S03E05 - 1080p.mkv",
+          "/TV Shows/The Office (2005)/Season 02/The Office S02E01 - Diversity Day.mkv"
+        ],
+        
+        "Formatos_Temporada_Episodio": {
+          "Preferido": "S{XX}E{YY}",
+          "Alternativo_1": "{X}x{YY}",
+          "Especiales": "S00E{XX} (para extras, behind-the-scenes, etc.)"
+        },
+        
+        "Titulo_Episodio_Opcional": {
+          "Formato": "{Título Serie} S{XX}E{YY} - {Título Episodio}.{ext}",
+          "Ejemplo": "Breaking Bad S01E01 - Pilot.mkv",
+          "Nota": "Jellyfin lo detecta automáticamente, pero es opcional"
+        }
+      },
+      
+      "Subtitulos_Externos": {
+        "Nomenclatura": "{Nombre_Archivo}.{idioma}{sufijo}.srt",
+        "Ejemplos": [
+          "Alien (1979).es.srt → Subtítulos en español",
+          "Alien (1979).en.forced.srt → Subtítulos forzados en inglés",
+          "Alien (1979).es.sdh.srt → Subtítulos SDH en español",
+          "Breaking Bad S01E01.en.srt",
+          "Breaking Bad S01E01.es-MX.srt → Español de México"
+        ],
+        
+        "Codigos_Idioma_ISO_639": {
+          "Usar": "Código ISO 639-1 de 2 letras (es, en, fr)",
+          "Variantes": "Agregar región con guión (es-MX, es-ES, en-GB)",
+          "Sufijos": ".forced | .sdh | .cc | .hi"
+        }
+      }
+    },
+    
+    "Proceso_Renombrado": {
+      "Pasos": [
+        {
+          "Paso": 1,
+          "Accion": "Obtener metadata del contenido",
+          "Fuente": "Resultado de Capas 0-3 + PELICULAS_SERIES + EPISODIOS tables"
+        },
+        {
+          "Paso": 2,
+          "Accion": "Sanitizar título",
+          "Algoritmo": [
+            "Remover caracteres inválidos para sistemas de archivos: / \\ : * ? \" < > |",
+            "Reemplazar con equivalentes seguros o espacios",
+            "Truncar si excede 255 caracteres (límite en la mayoría de sistemas)",
+            "Mantener acentos y caracteres Unicode (ñ, é, ü, etc.)"
+          ],
+          "Ejemplos_Transformacion": {
+            "Original": "Spider-Man: Into the Spider-Verse",
+            "Sanitizado": "Spider-Man Into the Spider-Verse",
+            "Original_2": "¿Qué pasó ayer?",
+            "Sanitizado_2": "¿Qué pasó ayer"
+          }
+        },
+        {
+          "Paso": 3,
+          "Accion": "Construir nombre de archivo",
+          "Variables_Disponibles": {
+            "titulo": "Título sanitizado",
+            "año": "Año de estreno",
+            "temporada": "Número de temporada (series)",
+            "episodio": "Número de episodio (series)",
+            "titulo_episodio": "Nombre del episodio (opcional)",
+            "calidad": "Extraído de ARCHIVO_INFO_TECNICA.calidad_tag",
+            "hdr": "Extraído de ARCHIVO_INFO_TECNICA.codec_hdr",
+            "edicion": "Detectado de nombre original (Director's Cut, etc.)",
+            "extension": "Extensión original del archivo"
+          },
+          
+          "Template_Pelicula": "{titulo} ({año}){metadata_opcional}.{extension}",
+          "Template_Serie": "{titulo} S{temporada:02d}E{episodio:02d}{metadata_opcional}.{extension}",
+          
+          "Construccion_Metadata_Opcional": {
+            "Reglas": [
+              "Solo incluir si la información está confirmada",
+              "Orden: calidad, HDR, edición",
+              "Separar con espacios, prefijo con ' - '",
+              "Ejemplos: ' - 1080p', ' - 4K HDR', ' - Director's Cut'"
+            ],
+            
+            "Logica_Inclusion": {
+              "Calidad": "Incluir siempre si >= 720p",
+              "HDR": "Incluir solo si presente (no es 'SDR')",
+              "Edicion": "Incluir si se detecta en nombre original o metadata"
+            }
+          }
+        },
+        {
+          "Paso": 4,
+          "Accion": "Construir ruta completa",
+          "Componentes": {
+            "Raiz_Peliculas": "configuracion.rutas.carpeta_destino_jellyfin + '/Movies'",
+            "Raiz_Series": "configuracion.rutas.carpeta_destino_jellyfin + '/TV Shows'",
+            "Carpeta_Contenido": "Películas: {título} ({año}) | Series: {título} ({año})",
+            "Carpeta_Temporada": "Series: Season {temporada:02d}",
+            "Archivo": "Nombre generado en Paso 3"
+          },
+          
+          "Path_Final_Pelicula": "{raiz}/Movies/{título} ({año})/{nombre_archivo}",
+          "Path_Final_Serie": "{raiz}/TV Shows/{título} ({año})/Season {temp}/{nombre_archivo}"
+        },
+        {
+          "Paso": 5,
+          "Accion": "Crear estructura de carpetas",
+          "Comando": "os.makedirs(directorio_destino, exist_ok=True)"
+        },
+        {
+          "Paso": 6,
+          "Accion": "Renombrar/Mover archivo",
+          "Opciones": {
+            "Mover": "shutil.move(origen, destino) - Cambia de ubicación",
+            "Copiar": "shutil.copy2(origen, destino) - Preserva original",
+            "Hard_Link": "os.link(origen, destino) - Mismo archivo, 2 nombres (ahorra espacio)",
+            "Sym_Link": "os.symlink(origen, destino) - Enlace simbólico"
+          },
+          
+          "Configuracion_Recomendada": {
+            "Por_Defecto": "Mover (shutil.move)",
+            "Si_Mismo_Filesystem": "Hard link (sin duplicar espacio)",
+            "Si_Quiere_Backup": "Copiar (consume doble espacio)"
+          }
+        }
+      ],
+      
+      "Manejo_Conflictos": {
+        "Archivo_Ya_Existe": {
+          "Opcion_1_Sobrescribir": "Reemplazar archivo existente (peligroso)",
+          "Opcion_2_Sufijo_Numero": "Agregar (1), (2), etc. al nombre",
+          "Opcion_3_Comparar_SHA256": "Si SHA256 es idéntico, es duplicado → ignorar",
+          "Opcion_4_Mejor_Calidad": "Comparar calidad, mantener el de mayor resolución",
+          "Recomendacion": "Opcion_3 (detectar duplicados) + Opcion_4 (upgrade automático)"
+        },
+        
+        "Ejemplo_Resolucion": {
+          "Situacion": "Ya existe 'Alien (1979).mkv' en 720p, nuevo archivo es 1080p",
+          "Accion": [
+            "1. Comparar ARCHIVO_INFO_TECNICA.calidad_tag",
+            "2. Nuevo es mejor → renombrar viejo a 'Alien (1979) - 720p.mkv'",
+            "3. Mover nuevo como 'Alien (1979).mkv' (será el default en Jellyfin)"
+          ]
+        }
+      }
+    },
+    
+    "Casos_Especiales": {
+      "Peliculas_Multi_Version": {
+        "Descripcion": "Múltiples ediciones de la misma película",
+        "Estructura": "/Movies/{Título} ({Año})/ con archivos diferenciados por edición",
+        "Ejemplos": [
+          "/Movies/Blade Runner (1982)/Blade Runner (1982) - Theatrical.mkv",
+          "/Movies/Blade Runner (1982)/Blade Runner (1982) - Director's Cut.mkv",
+          "/Movies/Blade Runner (1982)/Blade Runner (1982) - Final Cut.mkv"
+        ],
+        "Configuracion_Jellyfin": "Jellyfin detecta automáticamente versiones múltiples"
+      },
+      
+      "Series_Anime": {
+        "Problema": "Anime usa nomenclatura diferente (absoluto vs S00E00)",
+        "Solucion_Jellyfin": "Usar numeración absoluta o crear estructura S01 con todos los eps",
+        "Ejemplo": "/TV Shows/One Piece (1999)/Season 01/One Piece E0001.mkv"
+      },
+      
+      "Especiales_Y_Extras": {
+        "Ubicacion": "Season 00 (cero)",
+        "Ejemplos": [
+          "/TV Shows/Breaking Bad (2008)/Season 00/Breaking Bad S00E01 - Behind the Scenes.mkv",
+          "/Movies/Alien (1979)/Alien (1979) - trailer.mkv (en carpeta de película)"
+        ]
+      }
+    }
+  },
+
+  "Optimizaciones_Rendimiento": {
+    "Descripcion": "Estrategias para procesar grandes volúmenes eficientemente",
+    
+    "Procesamiento_Paralelo": {
+      "Capa_0_TMDb": {
+        "Paralelizable": true,
+        "Max_Workers": 4,
+        "Razon": "Consultas API independientes, limitado solo por rate limit"
+      },
+      
+      "Capa_1_pHash": {
+        "Paralelizable": true,
+        "Max_Workers": "CPU cores - 1",
+        "Razon": "Operación CPU-intensiva, aprovechar todos los cores",
+        "Nota": "Usar multiprocessing.Pool o concurrent.futures.ProcessPoolExecutor"
+      },
+      
+      "Capa_2_AcoustID": {
+        "Paralelizable": "Limited",
+        "Max_Workers": 2,
+        "Razon": "Rate limit de 2.2 req/s compartido globalmente",
+        "Implementacion": "threading.Semaphore(2) global"
+      },
+      
+      "Capa_3_Gemini": {
+        "Paralelizable": false,
+        "Max_Workers": 1,
+        "Razon": "Costoso, procesar secuencialmente para control de gastos"
+      }
+    },
+    
+    "Caching_Estrategico": {
+      "Cache_TMDb_Metadata": {
+        "Descripcion": "Guardar resultados de búsquedas en TMDb",
+        "Tabla": "Agregar a PELICULAS_SERIES",
+        "TTL": "30 días",
+        "Beneficio": "Evitar búsquedas repetidas para contenido popular"
+      },
+      
+      "Cache_pHash_Archivos_Procesados": {
+        "Descripcion": "Guardar hashes de archivos ya analizados",
+        "Donde": "ANALISIS_DE_ARCHIVOS.capa_1_score_phash",
+        "Beneficio": "Si se vuelve a escanear mismo archivo, saltar Capa 1"
+      },
+      
+      "Cache_Acoust
+
+ID": {
+        "Descripcion": "Ver CACHE_ACOUSTICID table",
+        "TTL": "90 días",
+        "Beneficio": "Reducir 90% de llamadas a API en re-escaneos"
+      }
+    },
+    
+    "Indexacion_Base_Datos": {
+      "Indices_Criticos": [
+        "CREATE INDEX idx_hash_lookup ON HASHES(tipo_hash, huella_valor(64))",
+        "CREATE INDEX idx_titulo_fuzzy ON PELICULAS_SERIES USING gin(to_tsvector('spanish', titulo_es))",
+        "CREATE INDEX idx_sha256 ON ANALISIS_DE_ARCHIVOS(hash_archivo_sha256)",
+        "CREATE INDEX idx_tmdb_episodio ON HASHES(tmdb_id, episodio_id)"
+      ],
+      
+      "Particionamiento": {
+        "Descripcion": "Para DB con >1M registros",
+        "Estrategia": "Particionar HASHES por tipo_hash",
+        "Beneficio": "Queries de pHash no escanean particiones de ACOUSTICID"
+      }
+    },
+    
+    "Procesamiento_Incremental": {
+      "Descripcion": "Procesar solo archivos nuevos/modificados",
+      "Estrategias": [
+        {
+          "Metodo": "inotify (Linux) / FSEvents (macOS) / ReadDirectoryChangesW (Windows)",
+          "Descripcion": "Monitoreo en tiempo real de cambios en carpetas",
+          "Beneficio": "Procesar archivos inmediatamente al agregarse"
+        },
+        {
+          "Metodo": "Escaneo periódico con timestamp",
+          "Descripcion": "Comparar modification time vs última ejecución",
+          "Comando": "find /media -name '*.mkv' -mtime -1 (archivos modificados en último día)",
+          "Beneficio": "Simple, sin dependencias externas"
+        },
+        {
+          "Metodo": "Base de datos de archivos conocidos",
+          "Descripcion": "Mantener lista de SHA256 procesados",
+          "Beneficio": "Detectar archivos nuevos/modificados/eliminados"
+        }
+      ]
+    }
+  },
+
+  "Interfaz_Usuario_Y_Reportes": {
+    "Descripcion": "Sistema de monitoreo y control del procesamiento",
+    
+    "Dashboard_Web_Opcional": {
+      "Framework_Sugerido": "Flask o FastAPI (Python)",
+      "Funcionalidades": [
+        "Vista de archivos en cola de procesamiento",
+        "Estado actual (procesando Capa X de archivo Y)",
+        "Estadísticas: Total procesados, confianza promedio, falsos positivos",
+        "Gráficas: Archivos por día, distribución de confianza, uso de capas",
+        "Log en tiempo real",
+        "Botón de pausa/reanudar procesamiento",
+        "Configuración de umbrales en vivo"
+      ]
+    },
+    
+    "Reportes_Generados": {
+"Reporte_Diario": {
+        "Nombre_Archivo": "reporte_{fecha}.html",
+        "Contenido": [
+          "Resumen ejecutivo: X archivos procesados, Y identificados, Z dudosos",
+          "Distribución por confianza: CONFIRMADO (X%), ALTA (Y%), MEDIA (Z%), BAJA (W%)",
+          "Uso de capas: Capa 0 (100%), Capa 1 (80%), Capa 2 (20%), Capa 3 (5%)",
+          "Costo del día: Gemini API: $X.XX USD, TMDb: $0 (gratis), AcoustID: $0",
+          "Top 10 contenido identificado",
+          "Archivos que requieren verificación manual (lista con enlaces)",
+          "Errores y warnings del día",
+          "Tiempo promedio de procesamiento por archivo"
+        ],
+        "Formato": "HTML con CSS embebido o Markdown",
+        "Envio_Email_Opcional": "Enviar a admin@domain.com cada 24h"
+      },
+      
+      "Reporte_Semanal": {
+        "Nombre_Archivo": "reporte_semanal_{semana}_{año}.pdf",
+        "Contenido": [
+          "Tendencias de la semana (gráficas)",
+          "Comparativa con semanas anteriores",
+          "Análisis de falsos positivos detectados",
+          "Sugerencias de optimización basadas en patrones",
+          "Proyección de costos mensuales",
+          "Estado de la base de datos (tamaño, crecimiento)",
+          "Rendimiento del sistema (tiempo de procesamiento, cuellos de botella)"
+        ]
+      },
+      
+      "Log_Detallado": {
+        "Ubicacion": "configuracion.rutas.carpeta_logs + '/contentid_{fecha}.log'",
+        "Nivel_Default": "INFO",
+        "Niveles_Disponibles": {
+          "DEBUG": "Todo, incluyendo hashes calculados y scores intermedios",
+          "INFO": "Inicio/fin de procesamiento, decisiones de capas",
+          "WARNING": "Archivos dudosos, discrepancias entre capas",
+          "ERROR": "Fallos de API, errores de lectura de archivos",
+          "CRITICAL": "Fallos que detienen el procesamiento"
+        },
+        
+        "Formato_Entrada": "[{timestamp}] [{nivel}] [{archivo}] {mensaje}",
+        "Ejemplo": "[2025-10-12 14:32:15] [INFO] [breaking_bad_s01e01.mkv] Capa 1: Score 0.87 - Match confirmado con tmdb_id=1396",
+        
+        "Rotacion": "Diaria, mantener últimos 30 días",
+        "Compresion": "Comprimir logs >7 días con gzip"
+      }
+    },
+    
+    "Notificaciones": {
+      "Eventos_Notificables": [
+        {
+          "Evento": "verificacion_manual_requerida",
+          "Condicion": "confianza_final = BAJA o DUDOSA",
+          "Accion": "Enviar notificación push/email con detalles del archivo",
+          "Prioridad": "MEDIA"
+        },
+        {
+          "Evento": "falso_positivo_detectado",
+          "Condicion": "Usuario reporta error o sistema detecta inconsistencia grave",
+          "Accion": "Alerta inmediata para revisar patrones",
+          "Prioridad": "ALTA"
+        },
+        {
+          "Evento": "presupuesto_gemini_excedido",
+          "Condicion": "Costo diario/mensual > umbral configurado",
+          "Accion": "Pausar Capa 3, notificar admin",
+          "Prioridad": "CRÍTICA"
+        },
+        {
+          "Evento": "rate_limit_alcanzado",
+          "Condicion": "API devuelve 429 Too Many Requests",
+          "Accion": "Pausar procesamiento temporalmente, registrar en log",
+          "Prioridad": "MEDIA"
+        },
+        {
+          "Evento": "disco_lleno",
+          "Condicion": "Espacio disponible < 10GB",
+          "Accion": "Pausar movimiento de archivos, notificar admin",
+          "Prioridad": "CRÍTICA"
+        }
+      ],
+      
+      "Canales_Notificacion": {
+        "Email": "SMTP configurado en settings",
+        "Webhook": "POST a URL configurada (Discord, Slack, etc.)",
+        "Telegram": "Bot de Telegram (opcional)",
+        "Sistema": "Notificaciones de escritorio (Linux/Windows/Mac)"
+      }
+    },
+    
+    "Interfaz_CLI": {
+      "Descripcion": "Línea de comandos para operación sin GUI",
+      
+      "Comandos_Principales": [
+        {
+          "Comando": "contentid scan /ruta/archivos",
+          "Descripcion": "Escanear carpeta y procesar archivos nuevos",
+          "Opciones": [
+            "--full: Re-procesar archivos ya analizados",
+            "--dry-run: Simular sin modificar archivos",
+            "--workers N: Número de workers paralelos",
+            "--skip-layer N: Saltar capa específica"
+          ]
+        },
+        {
+          "Comando": "contentid status",
+          "Descripcion": "Mostrar estado actual del procesamiento",
+          "Salida": "Archivos en cola, archivo actual, progreso general"
+        },
+        {
+          "Comando": "contentid report [diario|semanal|mensual]",
+          "Descripcion": "Generar reporte específico",
+          "Opciones": ["--format [html|pdf|json]", "--email destinatario@example.com"]
+        },
+        {
+          "Comando": "contentid verify {archivo}",
+          "Descripcion": "Re-procesar un archivo específico con logs detallados",
+          "Uso": "Para debugging de falsos positivos"
+        },
+        {
+          "Comando": "contentid config set {clave} {valor}",
+          "Descripcion": "Cambiar configuración en caliente",
+          "Ejemplos": [
+            "contentid config set capa_1.umbral 0.65",
+            "contentid config set gemini.habilitado false"
+          ]
+        },
+        {
+          "Comando": "contentid stats",
+          "Descripcion": "Estadísticas generales de la base de datos",
+          "Salida": "Total archivos, distribución por confianza, uso de capas, costos acumulados"
+        }
+      ]
+    }
+  },
+
+  "Seguridad_Y_Privacidad": {
+    "Descripcion": "Consideraciones de seguridad para el sistema",
+    
+    "Proteccion_API_Keys": {
+      "Almacenamiento": "Variables de entorno o archivo .env (NUNCA en código)",
+      "Archivo_Ejemplo": ".env.example con placeholders",
+      "Permisos": "chmod 600 .env (solo lectura por owner)",
+      "Git": "Agregar .env a .gitignore"
+    },
+    
+    "Acceso_Base_Datos": {
+      "Usuario_Dedicado": "Crear usuario SQL específico para la aplicación",
+      "Permisos_Minimos": "SELECT, INSERT, UPDATE en tablas necesarias (no DROP, CREATE)",
+      "Conexion_Cifrada": "Usar SSL/TLS para conexiones a DB remota",
+      "Password": "Almacenar en .env, nunca hardcodear"
+    },
+    
+    "Validacion_Entrada": {
+      "Paths": "Sanitizar rutas de archivos para prevenir path traversal",
+      "Nombres_Archivos": "Validar contra regex seguro antes de renombrar",
+      "Metadata": "Escapar caracteres especiales antes de insertar en DB",
+      "Comandos_Shell": "Usar subprocess con lista de args (no shell=True)"
+    },
+    
+    "Privacidad_Datos": {
+      "Log_Sanitization": "No registrar rutas completas de archivos con información personal",
+      "Anonimizacion": "Opcional: hash de nombres de archivos en logs públicos",
+      "Retencion": "Política de borrado de logs >90 días",
+      "GDPR_Compliance": "Si aplica, permitir exportación/borrado de datos del usuario"
+    },
+    
+    "Gemini_API_Considerations": {
+      "Datos_Enviados": "Solo fotogramas de video + metadata básica",
+      "No_Enviar": "Información personal, rutas de archivos locales",
+      "Cache_Local": "Guardar respuestas de Gemini localmente para no re-enviar",
+      "Opt_Out": "Permitir deshabilitar Capa 3 completamente si hay preocupaciones de privacidad"
+    }
+  },
+
+  "Instalacion_Y_Deployment": {
+    "Descripcion": "Guía de instalación y despliegue del sistema",
+    
+    "Requisitos_Sistema": {
+      "OS": "Linux (Ubuntu 20.04+), macOS (10.15+), Windows 10/11",
+      "Python": "3.9+",
+      "RAM": "Mínimo 4GB, recomendado 8GB+ para procesamiento paralelo",
+      "CPU": "Mínimo 2 cores, recomendado 4+ cores",
+      "Disco": "Depende del tamaño de la biblioteca (50GB+ libres recomendados)",
+      "Red": "Conexión estable para APIs (TMDb, AcoustID, Gemini)"
+    },
+    
+    "Dependencias_Sistema": {
+      "ffmpeg": {
+        "Version": "4.4+",
+        "Instalacion_Linux": "sudo apt install ffmpeg",
+        "Instalacion_macOS": "brew install ffmpeg",
+        "Instalacion_Windows": "Descargar desde ffmpeg.org"
+      },
+      "chromaprint": {
+        "Version": "1.5+",
+        "Instalacion_Linux": "sudo apt install libchromaprint-tools",
+        "Instalacion_macOS": "brew install chromaprint",
+        "Instalacion_Windows": "Incluido con pyacoustid"
+      },
+      "Base_Datos": {
+        "Opciones": "PostgreSQL 14+ (recomendado) o MySQL 8.0+",
+        "Instalacion_Docker": "docker run -d -p 5432:5432 -e POSTGRES_PASSWORD=pass postgres:14"
+      }
+    },
+    
+    "Instalacion_Python": {
+      "Virtual_Environment": [
+        "python3 -m venv venv",
+        "source venv/bin/activate  # Linux/Mac",
+        "venv\\Scripts\\activate  # Windows"
+      ],
+      
+      "Dependencias_requirements.txt": [
+        "ffmpeg-python>=0.2.0",
+        "pyacoustid>=1.2.0",
+        "imagehash>=4.3.0",
+        "pillow>=9.0.0",
+        "requests>=2.28.0",
+        "python-Levenshtein>=0.20.0",
+        "google-generativeai>=0.3.0",
+        "psycopg2-binary>=2.9.0  # PostgreSQL",
+        "pymysql>=1.0.0  # MySQL alternativo",
+        "python-dotenv>=0.20.0",
+        "click>=8.1.0  # Para CLI",
+        "jinja2>=3.1.0  # Para reportes HTML",
+        "flask>=2.3.0  # Opcional: dashboard web"
+      ],
+      
+      "Instalacion": "pip install -r requirements.txt"
+    },
+    
+    "Configuracion_Inicial": {
+      "Archivo_Config": "config.yaml o settings.py",
+      
+      "Plantilla_Config": {
+        "database": {
+          "type": "postgresql",
+          "host": "localhost",
+          "port": 5432,
+          "name": "contentid_db",
+          "user": "contentid_user",
+          "password": "${DB_PASSWORD}"
+        },
+        "apis": {
+          "tmdb_api_key": "${TMDB_API_KEY}",
+          "acoustid_api_key": "${ACOUSTID_API_KEY}",
+          "gemini_api_key": "${GEMINI_API_KEY}"
+        },
+        "rutas": {
+          "carpeta_escaneo": "/media/downloads",
+          "carpeta_destino_jellyfin": "/media/jellyfin",
+          "carpeta_cuarentena": "/media/cuarentena",
+          "carpeta_logs": "/var/log/contentid"
+        },
+        "capas": {
+          "capa_0": {"habilitado": true, "umbral": 0.70},
+          "capa_1": {"habilitado": true, "umbral": 0.60},
+          "capa_2": {"habilitado": true, "umbral": 0.75},
+          "capa_3": {"habilitado": true, "umbral_confianza": 0.70, "presupuesto_mensual_usd": 50}
+        },
+        "modulos": {
+          "analisis_tecnico": true,
+          "normalizacion_audio": true,
+          "normalizacion_subtitulos": true,
+          "insertar_metadata": true,
+          "renombrado_jellyfin": true,
+          "mover_archivos": false
+        }
+      }
+    },
+    
+    "Inicializacion_Base_Datos": {
+      "Script": "scripts/init_database.sql",
+      "Ejecucion": "psql -U postgres -d contentid_db -f scripts/init_database.sql",
+      "Incluye": [
+        "Creación de todas las tablas",
+        "Indices iniciales",
+        "Usuario de aplicación con permisos mínimos",
+        "Datos de seed (diccionario de idiomas, etc.)"
+      ]
+    },
+    
+    "Poblacion_Inicial_Referencia": {
+      "Descripcion": "Poblar PELICULAS_SERIES y HASHES con contenido de referencia",
+      
+      "Opcion_1_Manual": {
+        "Paso_1": "Identificar contenido legítimo que ya posees",
+        "Paso_2": "Extraer hashes con script scripts/generate_reference_hashes.py",
+        "Paso_3": "Insertar en DB con metadata de TMDb"
+      },
+      
+      "Opcion_2_Crowdsourced": {
+        "Descripcion": "Descargar DB pre-poblada de la comunidad (si existe)",
+        "Riesgo": "Confiar en datos de terceros, validar antes de usar"
+      },
+      
+      "Opcion_3_Incremental": {
+        "Descripcion": "Empezar con DB vacía, poblar gradualmente",
+        "Flujo": [
+          "Procesar archivo → Identificar con Capas 0-3",
+          "Si confianza ALTA → Generar hashes de referencia",
+          "Agregar a HASHES para futuras comparaciones"
+        ],
+        "Ventaja": "La DB crece automáticamente con el uso"
+      }
+    },
+    
+    "Deployment_Opciones": {
+      "Opcion_1_Local": {
+        "Descripcion": "Ejecutar directamente en servidor/NAS",
+        "Comando": "python contentid.py scan /media/archivos",
+        "Pros": "Simple, control total",
+        "Contras": "Manual, no automático"
+      },
+      
+      "Opcion_2_Systemd_Service": {
+        "Descripcion": "Servicio de sistema que monitorea carpetas",
+        "Archivo": "/etc/systemd/system/contentid.service",
+        "Contenido_Ejemplo": "[Unit]\nDescription=ContentID Scanner\nAfter=network.target\n\n[Service]\nType=simple\nUser=contentid\nWorkingDirectory=/opt/contentid\nExecStart=/opt/contentid/venv/bin/python contentid.py daemon\nRestart=always\n\n[Install]\nWantedBy=multi-user.target",
+        "Comandos": [
+          "sudo systemctl enable contentid",
+          "sudo systemctl start contentid"
+        ]
+      },
+      
+      "Opcion_3_Docker": {
+        "Descripcion": "Contenedor Docker para portabilidad",
+        "Dockerfile_Ejemplo": "Ver repositorio para Dockerfile completo",
+        "Docker_Compose": "Incluir servicio + PostgreSQL + opcional dashboard web",
+        "Volumenes": [
+          "/media/archivos:/data/scan:ro",
+          "/media/jellyfin:/data/output:rw",
+          "./config:/config:ro",
+          "./logs:/logs:rw"
+        ]
+      },
+      
+      "Opcion_4_Cron_Job": {
+        "Descripcion": "Ejecutar escaneos periódicos con cron",
+        "Crontab_Ejemplo": "0 */6 * * * /opt/contentid/venv/bin/python /opt/contentid/contentid.py scan /media/archivos >> /var/log/contentid/cron.log 2>&1",
+        "Explicacion": "Ejecutar cada 6 horas"
+      }
+    }
+  },
+
+  "Mantenimiento_Y_Troubleshooting": {
+    "Descripcion": "Guía de mantenimiento y solución de problemas comunes",
+    
+    "Tareas_Mantenimiento_Periodico": {
+      "Diario": [
+        "Revisar archivos en cuarentena (verificación manual)",
+        "Verificar logs de errores",
+        "Monitorear uso de API (especialmente Gemini)"
+      ],
+      "Semanal": [
+        "Revisar reporte semanal de falsos positivos",
+        "Optimizar umbr ales basado en resultados",
+        "Limpiar tabla CACHE_ACOUSTICID (borrar entradas expiradas)",
+        "Backup de base de datos"
+      ],
+      "Mensual": [
+        "Analizar patrones de falsos positivos y ajustar heurísticas",
+        "Actualizar diccionario de idiomas si es necesario",
+        "Re-indexar tablas de DB si es necesario",
+        "Revisar y actualizar alias_conocidos en PELICULAS_SERIES",
+        "Evaluar costos de API y ajustar presupuestos"
+      ],
+      "Anual": [
+        "Auditoría completa de precisión del sistema",
+        "Actualizar dependencias de Python",
+        "Revisar convenciones de Jellyfin (pueden cambiar)",
+        "Purgar logs y datos antiguos según política de retención"
+      ]
+    },
+    
+    "Problemas_Comunes": [
+      {
+        "Problema": "Muchos falsos positivos en series",
+        "Causas_Posibles": [
+          "Umbral de Capa 1 muy bajo",
+          "Comparando contra toda la temporada en vez de episodio específico",
+          "Intro/Outro idénticas no están siendo ignoradas"
+        ],
+        "Soluciones": [
+          "Aumentar umbral de Capa 1 a 0.65-0.70",
+          "Verificar que HASHES.episodio_id esté correctamente poblado",
+          "Ajustar tiempos de extracción de fotogramas para evitar intro/outro"
+        ]
+      },
+      {
+        "Problema": "AcoustID siempre retorna NO_ENCONTRADO",
+        "Causas_Posibles": [
+          "Audio del archivo está en idioma diferente (doblaje)",
+          "Calidad de audio muy baja o muy comprimida",
+          "Contenido muy reciente no está en base de AcoustID"
+        ],
+        "Soluciones": [
+          "Analizar TODAS las pistas de audio, no solo la primera",
+          "Aumentar duración del fragmento de audio analizado (120 → 180 seg)",
+          "Reducir peso de Capa 2 en decisión final para contenido nuevo"
+        ]
+      },
+      {
+        "Problema": "Gemini retorna resultados inconsistentes",
+        "Causas_Posibles": [
+          "Prompt muy ambiguo",
+          "Fotogramas extraídos son de baja calidad (negros, créditos)",
+          "Modelo tiene alucinaciones"
+        ],
+        "Soluciones": [
+          "Refinar prompt con más contexto y restricciones",
+          "Implementar filtro de fotogramas (evitar negros, texto excesivo)",
+          "Aumentar umbral de confianza de Capa 3 a 0.80",
+          "Validar respuesta JSON antes de confiar en ella"
+        ]
+      },
+      {
+        "Problema": "Procesamiento muy lento",
+        "Causas_Posibles": [
+          "Procesamiento secuencial",
+          "DB sin índices",
+          "Extracción de fotogramas ineficiente"
+        ],
+        "Soluciones": [
+          "Activar procesamiento paralelo (max_workers > 1)",
+          "Verificar que todos los índices estén creados",
+          "Usar cache de hashes para evitar re-procesar",
+          "Optimizar queries SQL con EXPLAIN ANALYZE"
+        ]
+      },
+      {
+        "Problema": "Archivos no se renombran/mueven",
+        "Causas_Posibles": [
+          "Permisos insuficientes",
+          "Filesystem diferente (move no funciona)",
+          "Caracteres inválidos en nombre destino"
+        ],
+        "Soluciones": [
+          "Verificar permisos con ls -la",
+          "Usar shutil.copy2 en vez de shutil.move si filesystem difiere",
+          "Mejorar sanitización de nombres de archivos"
+        ]
+      },
+      {
+        "Problema": "Costos de Gemini muy altos",
+        "Causas_Posibles": [
+          "Capa 3 activándose demasiado frecuentemente",
+          "Fotogramas de alta resolución",
+          "No hay cache de resultados"
+        ],
+        "Soluciones": [
+          "Aumentar umbral de Capa 1 para reducir casos dudosos",
+          "Reducir resolución de fotogramas a 1024x576",
+          "Implementar cache de respuestas de Gemini",
+          "Configurar límite diario de llamadas"
+        ]
+      }
+    ],
+    
+    "Comandos_Debugging": {
+      "Ver_Logs_En_Tiempo_Real": "tail -f /var/log/contentid/contentid_$(date +%Y-%m-%d).log",
+      "Procesar_Con_Debug": "python contentid.py verify archivo.mkv --log-level DEBUG",
+      "Verificar_DB_Connection": "psql -U contentid_user -d contentid_db -c 'SELECT COUNT(*) FROM ANALISIS_DE_ARCHIVOS;'",
+      "Test_API_TMDb": "curl 'https://api.themoviedb.org/3/search/movie?api_key=YOUR_KEY&query=Matrix'",
+      "Test_API_AcoustID": "fpcalc test_audio.wav && curl -X POST 'https://api.acoustid.org/v2/lookup' -d 'client=YOUR_KEY&duration=120&fingerprint=...'",
+      "Ver_Metadata_Archivo": "ffprobe -v quiet -print_format json -show_format -show_streams archivo.mkv | jq ."
+    }
+  },
+
+  "Roadmap_Futuro": {
+    "Descripcion": "Mejoras y características planificadas",
+    
+    "Fase_1_MVP": {
+      "Estado": "En desarrollo",
+      "Características": [
+        "Capas 0, 1, 2, 3 funcionales",
+        "Normalización de metadata básica",
+        "Renombrado Jellyfin",
+        "CLI básico",
+        "Logging"
+      ]
+    },
+    
+    "Fase_2_Optimizacion": {
+      "Estado": "Planificado",
+      "Características": [
+        "Dashboard web interactivo",
+        "Sistema de aprendizaje de falsos positivos",
+        "Optimizaciones de rendimiento",
+        "Soporte para más formatos de video",
+        "Integración con Jellyfin API (actualizar metadata directamente)"
+      ]
+    },
+    
+    "Fase_3_Expansion": {
+      "Estado": "Futuro",
+      "Características": [
+        "Soporte para anime (MAL, AniDB)",
+        "Detección de duplicados (misma película en diferentes calidades)",
+        "Descarga automática de posters/fanart",
+        "Generación automática de NFO files",
+        "Integración con Radarr/Sonarr",
+        "App móvil para revisión manual",
+        "API REST para integraciones externas"
+      ]
+    },
+    
+    "Ideas_Experimentales": [
+      "Usar modelos de IA locales (Llama, Mistral) en vez de Gemini",
+      "Fingerprinting de subtítulos para validación adicional",
+      "Crowd-sourced database de hashes (con privacidad)",
+      "Detección de intro/outro automática con ML",
+      "Predicción de calidad de video con IA"
+    ]
+  },
+
+  "Licencia_Y_Disclaimer": {
+    "Licencia": "MIT License (o la que elijas)",
+    "Proposito": "Uso personal y educativo para organización de biblioteca multimedia PROPIA",
+    
+    "Disclaimer": "⚠️ ADVERTENCIA LEGAL: Este software está diseñado EXCLUSIVAMENTE para ayudar a usuarios a ORGANIZAR contenido multimedia que ya poseen LEGALMENTE. NO está diseñado ni debe ser usado para:\n\n- Piratería o distribución de contenido protegido por derechos de autor\n- Identificación de contenido con propósito de infringir copyright\n- Cualquier actividad ilegal según las leyes de tu jurisdicción\n\nEl uso de este software para identificar contenido pirata NO legaliza dicho contenido. Los usuarios son COMPLETAMENTE RESPONSABLES de asegurarse que tienen los derechos legales para poseer y usar cualquier archivo multimedia que procesan con este software.\n\nLos desarrolladores de este proyecto NO se hacen responsables del uso indebido del software.",
+    
+    "Uso_Etico": [
+      "✅ Organizar DVDs/Blu-rays que compraste",
+      "✅ Organizar grabaciones legales de TV",
+      "✅ Organizar contenido de servicios de streaming que permiten descargas",
+      "❌ Organizar contenido de torrents ilegales",
+      "❌ Facilitar distribución de contenido pirata",
+      "❌ Vender o lucrar con contenido identificado ilegalmente"
+    ]
+  },
+
+  "Metadata_Del_Proyecto": {
+    "Nombre_Proyecto": "ContentID Local Piracy Detector & Jellyfin Normalizer",
+    "Version": "2.0.0",
+    "Autor": "Tu Nombre",
+    "Repositorio": "https://github.com/tuusuario/contentid",
+    "Documentacion": "https://contentid.readthedocs.io",
+    "Licencia": "MIT",
+    "Python_Minimo": "3.9",
+    "Ultima_Actualizacion": "2025-10-12",
+    
+    "Contribuciones": {
+      "Como_Contribuir": "Ver CONTRIBUTING.md",
+      "Codigo_De_Conducta": "Ver CODE_OF_CONDUCT.md",
+      "Reportar_Bugs": "Abrir issue en GitHub con template de bug report",
+      "Solicitar_Funcionalidades": "Abrir issue con template de feature request",
+      "Pull_Requests": "Bienvenidos! Seguir guía de estilo en CONTRIBUTING.md"
+    },
+    
+    "Comunidad": {
+      "Discord": "https://discord.gg/contentid",
+      "Forum": "https://forum.contentid.dev",
+      "Wiki": "https://github.com/tuusuario/contentid/wiki"
+    }
+  }
+}

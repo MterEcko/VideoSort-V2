@@ -1,12 +1,27 @@
 {
   "tmdb_api_key": "f98a4a1f467421762760132e1b91df58",
   "thetvdb_api_key": "TU_CLAVE_TVDB_AQUI",
-  "video_extensions": [".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".webm", ".m4v"],
+  "video_extensions": [
+    ".mp4",
+    ".mkv",
+    ".avi",
+    ".mov",
+    ".wmv",
+    ".flv",
+    ".webm",
+    ".m4v"
+  ],
   "max_processes": 4,
   "capture_frames": 30,
   "min_confidence": 0.7,
   "detect_actors": true,
   "detect_studios": true,
   "analyze_audio": false,
-  "jellyfin_naming": true
+  "jellyfin_naming": true,
+  "jellyfin_url": "http://10.10.1.111:8096",
+  "jellyfin_api_key": "c07d422f84bc40579b5f918aa60ea97f",
+  "jellyfin_user_id": "b539b933d5c04d408040856f08084fd4",
+  "youtube_quality": "480p",
+  "whisper_model": "large",
+  "audio_language": "es"
 }
